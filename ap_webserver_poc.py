@@ -102,7 +102,11 @@ PAGE_HTML = """<!DOCTYPE html>
  th{background:#f3f3f3;text-align:left}
  td.v{text-align:right;font-variant-numeric:tabular-nums}
  tr:nth-child(even){background:#f2f2f2}
- #status{color:#888;font-size:13px;margin-top:.5em}
+ #last{color:#555;font-size:13px;margin:.75em 0}
+ #status{color:#888;font-size:13px}
+ #charts{display:flex;flex-wrap:wrap;gap:1em;margin-top:1em}
+ .chart{border:1px solid #eee;border-radius:6px;width:420px;max-width:100%}
+ button{cursor:pointer;border-radius:23px;min-height:40px;font-weight:700;font-size:14px;padding:0 18px;border:none;background:rgba(66,201,201,1);color:#fff;margin:.5em 0}
  footer{margin:1em;color:#888;font-size:13px}
 </style>
 </head>
@@ -113,18 +117,64 @@ PAGE_HTML = """<!DOCTYPE html>
 </header>
 <main>
  <table id="t"><tr><th>Sensor</th><th>Value</th></tr></table>
+ <div id="last">Last update: never</div>
+ <button onclick="dlCsv()">Download as CSV</button>
+ <div id="charts"></div>
  <div id="status">connecting...</div>
 </main>
 <footer>Auto-updating every 2&nbsp;s &middot; served live from the WiFi module</footer>
 <script>
- var t=document.getElementById('t'), s=document.getElementById('status');
+ var s=document.getElementById('status'),tbl=document.getElementById('t'),
+     last=document.getElementById('last'),charts=document.getElementById('charts');
+ var samples=[],rows={},noPlot={'served.requests':1};
+ function vals(k){var a=[],n=samples.length,st=n>60?n-60:0,i;
+  for(i=st;i<n;i++){var v=samples[i].d[k];if(v!==undefined){var f=parseFloat(v);a.push(isNaN(f)?0:f);}}
+  return a;}
+ function dlCsv(){var keys=[],i,k;
+  for(i=0;i<samples.length;i++)for(k in samples[i].d)if(keys.indexOf(k)<0)keys.push(k);
+  var csv='time;'+keys.join(';')+'\\n';
+  for(i=0;i<samples.length;i++){var r=samples[i],row=r.t,j;
+   for(j=0;j<keys.length;j++){var v=r.d[keys[j]];row+=';'+(v===undefined?'':v);}
+   csv+=row+'\\n';}
+  var a=document.createElement('a');a.download='calliope-log.csv';
+  a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.click();}
+ function svg(title,a){
+  var W=420,H=200,pl=46,pr=10,pt=20,pb=22,gw=W-pl-pr,gh=H-pt-pb,i,j;
+  var s='<svg viewBox="0 0 '+W+' '+H+'" width="100%" style="display:block">';
+  s+='<text x="'+pl+'" y="13" fill="#4a5261" font-family="sans-serif" font-size="12" font-weight="bold">'+title+'</text>';
+  if(a.length<2)return s+'<text x="'+pl+'" y="'+(H/2)+'" fill="#aaa" font-family="sans-serif" font-size="11">collecting...</text></svg>';
+  var mn=Math.min.apply(null,a),mx=Math.max.apply(null,a);if(mn==mx){mn-=1;mx+=1;}
+  function yf(v){return (pt+gh-((v-mn)/(mx-mn))*gh).toFixed(1);}
+  function xf(q){return (pl+q/(a.length-1)*gw).toFixed(1);}
+  s+='<path d="M'+pl+' '+pt+'L'+pl+' '+(pt+gh)+'L'+(pl+gw)+' '+(pt+gh)+'" fill="none" stroke="#ccc"/>';
+  var yl=[mx,(mx+mn)/2,mn];
+  for(j=0;j<3;j++){var yy=yf(yl[j]);
+   s+='<line x1="'+pl+'" y1="'+yy+'" x2="'+(pl+gw)+'" y2="'+yy+'" stroke="#eee"/>';
+   s+='<text x="2" y="'+(+yy+3)+'" fill="#888" font-family="sans-serif" font-size="10">'+yl[j].toFixed(1)+'</text>';}
+  var p='';for(i=0;i<a.length;i++)p+=xf(i)+','+yf(a[i])+' ';
+  s+='<polyline fill="none" stroke="rgba(66,201,201,1)" stroke-width="2" points="'+p+'"/>';
+  var tk=4;for(i=0;i<=tk;i++){var f=i/tk,xx=(pl+f*gw).toFixed(1),ago=Math.round((1-f)*(a.length-1)*2);
+   s+='<line x1="'+xx+'" y1="'+(pt+gh)+'" x2="'+xx+'" y2="'+(pt+gh+3)+'" stroke="#ccc"/>';
+   s+='<text x="'+xx+'" y="'+(H-6)+'" fill="#888" font-family="sans-serif" font-size="9" text-anchor="'+(i==0?'start':i==tk?'end':'middle')+'">'+(ago?'-'+ago+'s':'now')+'</text>';}
+  return s+'</svg>';
+ }
  async function tick(){
   try{
-   var r=await fetch('/data',{cache:'no-store'});
-   var d=await r.json();
-   var h='<tr><th>Sensor</th><th>Value</th></tr>';
-   for(var k in d){h+='<tr><td>'+k+'</td><td class="v">'+d[k]+'</td></tr>';}
-   t.innerHTML=h;
+   var resp=await fetch('/data',{cache:'no-store'});var d=await resp.json(),k;
+   var now=new Date().toLocaleString();
+   samples.push({t:now,d:d});if(samples.length>5000)samples.shift();
+   for(k in d){
+    if(!rows[k]){
+     var tr=tbl.insertRow();tr.insertCell().textContent=k;
+     var vc=tr.insertCell();vc.className='v';
+     var bx=null;
+     if(!noPlot[k]){bx=document.createElement('div');bx.className='chart';charts.appendChild(bx);}
+     rows[k]={v:vc,b:bx};
+    }
+    rows[k].v.textContent=d[k];
+    if(rows[k].b)rows[k].b.innerHTML=svg(k,vals(k));
+   }
+   last.textContent='Last update: '+now;
    s.textContent='updated';
   }catch(e){s.textContent='(waiting for data...)';}
  }
@@ -163,16 +213,18 @@ def data_json() -> str:
 def http_response(status: str, content_type: str, body: str) -> bytes:
     """Minimal HTTP/1.1 response with a correct, auto-computed length.
 
-    Content-Length lets the browser render without us closing the socket, and
-    Connection: close tells the browser to close it -- so we never issue
-    AT+CIPCLOSE ourselves (that raced with recycled link ids and hung reloads).
+    Content-Length marks where the response ends, and Connection: keep-alive
+    tells the browser to REUSE the same socket for every poll instead of
+    reconnecting each time. That avoids the per-request open/close churn that
+    fragments the module's heap and eventually reboots it.
     """
     body_bytes = body.encode("utf-8")
     headers = (
         f"HTTP/1.1 {status}\r\n"
         f"Content-Type: {content_type}; charset=utf-8\r\n"
         f"Content-Length: {len(body_bytes)}\r\n"
-        "Connection: close\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: keep-alive\r\n"
         "\r\n"
     )
     return headers.encode("ascii") + body_bytes
@@ -243,6 +295,12 @@ def setup_access_point(ser, ssid: str, password: str, channel: int, open_net: bo
     if send_cmd(ser, "AT", timeout=2) != "OK":
         log("No 'OK' from module. Check wiring (TX/RX/GND) and baud rate.")
 
+    # Configure in RAM only -- never write WiFi config to the module's flash.
+    # (ESP-AT defaults to SYSSTORE=1, which is what persisted "CalliopeTest".)
+    # Must be set before CWMODE/CWSAP. It resets to default on reboot, so we
+    # re-send it here every setup (initial and reboot-recovery).
+    send_cmd(ser, "AT+SYSSTORE=0")
+
     log("Switching to SoftAP mode ...")
     send_cmd(ser, "AT+CWMODE=2")
 
@@ -255,9 +313,17 @@ def setup_access_point(ser, ssid: str, password: str, channel: int, open_net: bo
     log("Enabling multiple connections ...")
     send_cmd(ser, "AT+CIPMUX=1")
 
-    # Reap idle/abandoned sockets quickly so the connection pool never fills,
-    # since we rely on the browser to close (we never AT+CIPCLOSE).
-    send_cmd(ser, "AT+CIPSTO=5")
+    # Keep-alive sockets are polled every ~2 s so they're never idle; this reaps
+    # a socket the browser abandoned (tab closed / switched WiFi). Kept short so a
+    # half-open connection frees the single slot quickly (the watchdog also helps).
+    send_cmd(ser, "AT+CIPSTO=10")
+
+    # Effectively one viewer, but allow 2 connections: browsers (notably Firefox)
+    # open a 2nd/backup socket while the slow multi-chunk page is still loading,
+    # and a single slot refuses it -> intermittent load failures. Two slots give
+    # that headroom; keep-alive still means no per-poll churn. (Must be set before
+    # the server is created.)
+    send_cmd(ser, "AT+CIPSERVERMAXCONN=2")
 
     log("Starting TCP server on port 80 ...")
     send_cmd(ser, "AT+CIPSERVER=1,80")
@@ -273,6 +339,12 @@ def setup_access_point(ser, ssid: str, password: str, channel: int, open_net: bo
 # Max bytes per AT+CIPSEND. Stay well under the firmware's per-send cap so a
 # multi-KB page (logo included) is sent as several sends on the same socket.
 CHUNK = 1024
+
+# If no request arrives for this long, assume the viewer vanished (e.g. switched
+# WiFi) leaving a half-open socket that holds the single connection slot. We then
+# close all sockets so a fresh browser can connect again. Must be well above the
+# 2 s poll interval so an active dashboard never triggers it.
+IDLE_RECOVER = 8.0
 
 
 def _send_chunk(ser, link_id: str, piece: bytes) -> bool:
@@ -290,30 +362,63 @@ def _send_chunk(ser, link_id: str, piece: bytes) -> bool:
 
 
 def serve(ser, link_id: str, response: bytes):
-    """Send the response in <=CHUNK pieces on the given link id. We do NOT close
-    it ourselves -- Content-Length + Connection: close let the browser render
-    and close, which avoids racing recycled link ids."""
+    """Send the response in <=CHUNK pieces. We do NOT close the connection --
+    Connection: keep-alive means the browser reuses this one socket for every
+    subsequent poll, so there is no open/close churn to fragment the module's
+    heap. An idle/abandoned socket is reaped by AT+CIPSTO."""
     for i in range(0, len(response), CHUNK):
         if not _send_chunk(ser, link_id, response[i:i + CHUNK]):
             log(f"    aborted serving connection {link_id} (closed/busy)")
-            return
+            break
+        time.sleep(0.02)   # small breather so we don't overrun the module
 
 
-# A request forwarded by the module looks like:  +IPD,<id>,<len>:GET <path> ...
-REQUEST_RE = re.compile(r"\+IPD,(\d+),\d+:GET (\S*)")
+# A request forwarded by the module looks like:  +IPD,<id>,<len>:GET <path> HTTP/...
+# Require the SPACE after the path so we only match a COMPLETE request line --
+# otherwise a half-received "GET /da" matches as path "/da" and we mis-route
+# (serving the whole page instead of the tiny /data JSON).
+REQUEST_RE = re.compile(r"\+IPD,(\d+),\d+:GET (\S+) ")
 
 
-def serve_forever(ser):
+def serve_forever(ser, reinit):
     buf = ""
+    last_request = time.time()
+    recovered = False
     while True:
         n = ser.in_waiting
         chunk = ser.read(n if n else 1)
         if not chunk:
+            # Watchdog: a viewer that switched WiFi leaves a half-open socket
+            # occupying the single connection slot, so new browsers get refused.
+            # After an idle gap, close all sockets to free the slot. Fires once
+            # per idle episode (reset when the next real request arrives).
+            if not recovered and time.time() - last_request > IDLE_RECOVER:
+                ser.write(b"AT+CIPCLOSE=5\r\n")   # link id 5 = all connections
+                if read_until(ser, ["CLOSED"], 1.0):
+                    log("idle: cleared a stale connection")
+                recovered = True
+                last_request = time.time()
             continue
         text = chunk.decode("latin-1", "replace")
         sys.stdout.write(text)
         sys.stdout.flush()
         buf += text
+
+        # Self-heal: the module prints "ready" when it (re)boots. Since we use
+        # AT+SYSSTORE=0, a reboot wipes the AP/server config -- so re-run setup,
+        # otherwise the dashboard dies permanently (no data, reloads fail).
+        if "ready" in buf:
+            log("module rebooted -- re-initialising access point ...")
+            buf = ""
+            time.sleep(0.5)                 # let the boot output settle
+            try:
+                ser.reset_input_buffer()
+            except Exception:
+                pass
+            reinit()
+            last_request = time.time()
+            recovered = False
+            continue
 
         m = REQUEST_RE.search(buf)
         if m:
@@ -323,6 +428,10 @@ def serve_forever(ser):
             label = path if path else "/"
             log(f"--> {label}  (connection {link_id})")
             serve(ser, link_id, route(path))
+            last_request = time.time()
+            recovered = False
+        elif len(buf) > 4096:
+            buf = buf[-512:]               # don't let partial data accumulate
 
 
 def main():
@@ -339,6 +448,9 @@ def main():
                    help="hold DTR/RTS low (for USB-UART bridges like CP2102/CH340 "
                         "that auto-reset the ESP via those lines). Default asserts "
                         "them, which native USB /dev/ttyACM* devices need.")
+    p.add_argument("--reset", action="store_true",
+                   help="factory-reset the module (AT+RESTORE) before setup, clearing "
+                        "any WiFi config a previous run persisted to flash.")
     args = p.parse_args()
 
     log(f"Opening {args.port} @ {args.baud} ...")
@@ -351,9 +463,19 @@ def main():
     time.sleep(0.3)
     ser.reset_input_buffer()
 
-    try:
+    def reinit():
         setup_access_point(ser, args.ssid, args.password, args.channel, args.open)
-        serve_forever(ser)
+
+    if args.reset:
+        log("Factory-resetting module (AT+RESTORE) to clear persisted config ...")
+        ser.write(b"AT+RESTORE\r\n")
+        read_until(ser, ["ready"], 6.0)      # module wipes flash and reboots
+        time.sleep(0.5)
+        ser.reset_input_buffer()
+
+    try:
+        reinit()                       # initial setup
+        serve_forever(ser, reinit)     # serves, and re-runs setup after a reboot
     except KeyboardInterrupt:
         log("\nStopping: shutting the server down ...")
         send_cmd(ser, "AT+CIPSERVER=0", timeout=2)
