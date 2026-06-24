@@ -430,10 +430,9 @@ namespace WiFi {
     // multi-KB page goes out as several sends on one socket.
     const CHUNK = 1024
 
-    // Sensor table shown on the page. Fed by setSensorValue() from your own
-    // sensors, radio handlers, etc.
-    let sensorKeys: string[] = []
-    let sensorVals: string[] = []
+    // The dashboard reads its data from the datalogger (single source). The user
+    // logs rows with datalogger.log(...); the driver serves them via getRows.
+    let logFull = false            // set by datalogger.onLogFull -> page banner
     let rxBuf = ""
     let cachedPage = ""
     let lastRequestTime = 0
@@ -475,6 +474,9 @@ namespace WiFi {
         apSsid = ssid
         apPasswd = passwd
         wifiBaudRate = baudRate
+
+        // Surface a "log full" banner on the dashboard when the flash log fills.
+        datalogger.onLogFull(function () { logFull = true })
 
         doApSetup()
         startBackgroundServer()
@@ -627,20 +629,6 @@ namespace WiFi {
         return ctrlSlider[which]
     }
 
-    /**
-     * Set (or update) a sensor reading shown on the web page.
-     */
-    //% block="Set sensor %name to %value"
-    //% group="Access Point"
-    export function setSensorValue(name: string, value: number) {
-        let i = sensorKeys.indexOf(name)
-        if (i < 0) {
-            sensorKeys.push(name)
-            sensorVals.push("" + value)
-        } else {
-            sensorVals[i] = "" + value
-        }
-    }
 
     // Handle one pending web request, if any. Called repeatedly by the background
     // server loop (startBackgroundServer); not a user-facing block.
@@ -718,8 +706,11 @@ namespace WiFi {
         if (path.indexOf("/controls") == 0) {
             return httpResponse("200 OK", "application/json", controlsJson())
         }
+        if (path.indexOf("/log.csv") == 0) {
+            return httpResponse("200 OK", "text/csv", logFullCsv())   // full log download
+        }
         if (path.indexOf("/data") == 0) {
-            return httpResponse("200 OK", "application/json", dataJson())
+            return httpResponse("200 OK", "text/csv", logRowsCsv())   // header + last 100 rows
         }
         if (path.indexOf("/favicon") == 0) {
             return httpResponse("204 No Content", "text/plain", "")
@@ -761,23 +752,33 @@ namespace WiFi {
             ",\"sC\":" + ctrlSlider[2] + "}"
     }
 
-    function dataJson(): string {
-        let s = "{"
-        for (let i = 0; i < sensorKeys.length; i++) {
-            if (i > 0) s += ","
-            s += "\"" + sensorKeys[i] + "\":\"" + sensorVals[i] + "\""
-        }
-        return s + "}"
+    // Datalogger is the single source. getRows(from, count): header is row 0,
+    // getNumberOfRows() includes the header. Returns CSV (commas=cols, \n=rows).
+
+    // For the poll: header + up to the last 100 data rows (charts read these).
+    function logRowsCsv(): string {
+        let total = datalogger.getNumberOfRows()    // includes header row 0
+        if (total <= 1) return datalogger.getRows(0, 1)   // header only / empty
+        let from = total - 100
+        if (from < 1) from = 1
+        return datalogger.getRows(0, 1) + "\n" + datalogger.getRows(from, 100)
+    }
+
+    // For the download: the entire log.
+    function logFullCsv(): string {
+        return datalogger.getRows(0, datalogger.getNumberOfRows())
     }
 
     function httpResponse(status: string, contentType: string, body: string): string {
         // Connection: keep-alive -> the browser reuses ONE socket for every poll
         // instead of reconnecting each time, avoiding the open/close churn that
         // fragments the module's heap and eventually reboots it.
+        // X-Log-Full lets the page show a "log full" banner.
         return "HTTP/1.1 " + status + "\r\n" +
             "Content-Type: " + contentType + "; charset=utf-8\r\n" +
             "Content-Length: " + body.length + "\r\n" +
             "Cache-Control: no-cache\r\n" +
+            "X-Log-Full: " + (logFull ? "1" : "0") + "\r\n" +
             "Connection: keep-alive\r\n\r\n" + body
     }
 
@@ -800,6 +801,7 @@ namespace WiFi {
                 "tr:nth-child(even){background:#f2f2f2}" +
                 "#last{color:#555;font-size:13px;margin:.75em 0}" +
                 "#status{color:#888;font-size:13px}" +
+                "#full{display:none;color:#c00;font-weight:700;font-size:13px;margin:.3em 0}" +
                 "#charts{display:flex;flex-wrap:wrap;gap:1em;margin-top:1em}" +
                 ".chart{border:1px solid #eee;border-radius:6px;width:420px;max-width:100%}" +
                 "button{cursor:pointer;border-radius:23px;min-height:40px;font-weight:700;font-size:14px;padding:0 18px;border:none;background:rgba(66,201,201,1);color:#fff;margin:.5em 0}" +
@@ -829,6 +831,7 @@ namespace WiFi {
                 "<div class=\"tablebox card\">" +
                 "<table id=\"t\"><tr><th>Sensor</th><th>Wert</th></tr></table>" +
                 "<div id=\"last\">Letzte Aktualisierung: nie</div>" +
+                "<div id=\"full\">Log voll!</div>" +
                 "<button onclick=\"dlCsv()\">Als CSV herunterladen</button>" +
                 "</div>" +
                 "<section id=\"ctrls\" class=\"card\"><h2>Steuerung</h2>" +
@@ -844,19 +847,17 @@ namespace WiFi {
                 "<footer>Aktualisiert sich alle 2&nbsp;s &middot; live vom WLAN-Modul</footer>" +
                 "<script>" +
                 "var s=document.getElementById('status'),tbl=document.getElementById('t')," +
-                "last=document.getElementById('last'),charts=document.getElementById('charts');" +
-                "var samples=[],rows={},noPlot={'anfragen':1};" +
-                "function vals(k){var a=[],n=samples.length,st=n>60?n-60:0,i;" +
-                "for(i=st;i<n;i++){var v=samples[i].d[k];if(v!==undefined){var f=parseFloat(v);a.push(isNaN(f)?0:f);}}" +
-                "return a;}" +
-                "function dlCsv(){var keys=[],i,k;" +
-                "for(i=0;i<samples.length;i++)for(k in samples[i].d)if(keys.indexOf(k)<0)keys.push(k);" +
-                "var csv='zeit;'+keys.join(';')+'\\n';" +
-                "for(i=0;i<samples.length;i++){var r=samples[i],row=r.t,j;" +
-                "for(j=0;j<keys.length;j++){var v=r.d[keys[j]];row+=';'+(v===undefined?'':v);}" +
-                "csv+=row+'\\n';}" +
+                "lu=document.getElementById('last'),charts=document.getElementById('charts')," +
+                "full=document.getElementById('full');" +
+                "var cols=[],rowEls=[];" +
+                "function build(h){cols=h;for(var ci=0;ci<h.length;ci++){" +
+                "var tr=tbl.insertRow();tr.insertCell().textContent=h[ci];" +
+                "var vc=tr.insertCell();vc.className='v';" +
+                "var bx=document.createElement('div');bx.className='chart';charts.appendChild(bx);" +
+                "rowEls.push({v:vc,b:bx});}}" +
+                "function dlCsv(){fetch('/log.csv',{cache:'no-store'}).then(function(r){return r.text();}).then(function(t){" +
                 "var a=document.createElement('a');a.download='calliope-log.csv';" +
-                "a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.click();}" +
+                "a.href=URL.createObjectURL(new Blob([t.replace(/,/g,';')],{type:'text/csv'}));a.click();});}" +
                 "function svg(title,a){" +
                 "var W=420,H=200,pl=46,pr=10,pt=20,pb=22,gw=W-pl-pr,gh=H-pt-pb,i,j;" +
                 "var s='<svg viewBox=\"0 0 '+W+' '+H+'\" width=\"100%\" style=\"display:block\">';" +
@@ -877,18 +878,20 @@ namespace WiFi {
                 "s+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}" +
                 "return s+'</svg>';}" +
                 "async function tick(){try{" +
-                "var resp=await fetch('/data',{cache:'no-store'});var d=await resp.json(),k;" +
-                "var now=new Date().toLocaleString();" +
-                "samples.push({t:now,d:d});if(samples.length>5000)samples.shift();" +
-                "for(k in d){" +
-                "if(!rows[k]){var tr=tbl.insertRow();tr.insertCell().textContent=k;" +
-                "var vc=tr.insertCell();vc.className='v';" +
-                "var bx=null;" +
-                "if(!noPlot[k]){bx=document.createElement('div');bx.className='chart';charts.appendChild(bx);}" +
-                "rows[k]={v:vc,b:bx};}" +
-                "rows[k].v.textContent=d[k];" +
-                "if(rows[k].b)rows[k].b.innerHTML=svg(k,vals(k));}" +
-                "last.textContent='Letzte Aktualisierung: '+now;" +
+                "var resp=await fetch('/data',{cache:'no-store'});" +
+                "full.style.display=(resp.headers.get('X-Log-Full')=='1')?'':'none';" +
+                "var t=await resp.text();" +
+                "var L=t.replace(/\\r/g,'').split('\\n'),R=[],li;" +
+                "for(li=0;li<L.length;li++)if(L[li].length)R.push(L[li].split(','));" +
+                "if(!R.length){s.textContent='(warte auf Daten...)';return;}" +
+                "if(!cols.length)build(R[0]);" +
+                "if(R.length<2){s.textContent='(warte auf Daten...)';return;}" +
+                "var last=R[R.length-1],ci;" +
+                "for(ci=0;ci<cols.length;ci++){if(!rowEls[ci])continue;" +
+                "rowEls[ci].v.textContent=last[ci]!==undefined?last[ci]:'';" +
+                "var arr=[],ri;for(ri=1;ri<R.length;ri++){var f=parseFloat(R[ri][ci]);arr.push(isNaN(f)?0:f);}" +
+                "rowEls[ci].b.innerHTML=svg(cols[ci],arr);}" +
+                "lu.textContent='Letzte Aktualisierung: '+new Date().toLocaleString();" +
                 "s.textContent='aktualisiert';" +
                 "}catch(e){s.textContent='(warte auf Daten...)';}}" +
                 "var elT=[document.getElementById('tA'),document.getElementById('tB'),document.getElementById('tC')];" +
