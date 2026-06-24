@@ -2,6 +2,16 @@ enum MessageType {
     UDP,
     TCP
 }
+// Selector for the web dashboard controls (toggles & sliders). Values are the
+// array index used by the driver.
+enum WebControl {
+    //% block="A"
+    A = 0,
+    //% block="B"
+    B = 1,
+    //% block="C"
+    C = 2
+}
 /**
  * Functions to operate Grove module.
  */
@@ -416,45 +426,8 @@ namespace WiFi {
     // repeated requests are tiny.
     // =========================================================================
 
-    // Official Calliope logo (inlined; the AP is offline so it can't be fetched).
-    const LOGO_SVG =
-        '<svg role="img" aria-labelledby="calliope-logo" xmlns="http://www.w3.org/2000/svg"' +
-        ' xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" viewBox="0 0 525.216 126.9">' +
-        '<path fill="#4a5261" d="M223.716 88.8h.2l5.6 17-11.1.1 5.3-17.1zm-4.9-11.1-14.3 42.2-3.5.5.1 5.8' +
-        ' 16.5-.1-.1-5.8-3.4-.6 2.1-6.7 15.7-.1 2.2 6.6-3.3.6v5.8l16.5-.2v-5.8l-3.5-.5-15-41.9-10 .2zm38.1 6.1' +
-        ' 5.1.9.4 34.7-5.2 1.1.1 5.8 36.4-.3-.2-13.6-7.4.1-.4 6.1-13.6.1-.4-34.1 5.2-1v-5.9l-5.2.1-9.7.1h-5.2zm46.7 0' +
-        ' 5.1.9.3 34.7-5.1 1.1.1 5.8 36.4-.3-.2-13.6-7.4.1-.4 6.1-13.7.1-.3-34.1 5.2-1v-5.9l-5.2.1-9.7.1h-5.2zm67 36.5' +
-        '-5.2-.9-.3-34.8 5.2-1-.1-5.9-20 .2v5.9l5.2.9.3 34.7-5.1 1.1.1 5.8 20.1-.2zm154.3-29.5-.2-13.2-33 .3h-5.2l.1' +
-        ' 5.9 5.1.9.3 34.7-5.1 1.1.1 5.8 38.2-.3-.1-13.3-7.4.1-.3 5.8-15.7.1-.1-13.8 16.4-.2-.1-7.4-16.4.1-.1-12.1' +
-        ' 15.5-.2.5 5.8z"/><g transform="translate(-183.184 -204.1)"><title id="calliope-logo">calliope mini logo' +
-        '</title><defs><path id="a" d="M133.2 204.1h234.3v188.7H133.2z"/></defs><clipPath id="b">' +
-        '<use xlink:href="#a" width="100%" height="100%" overflow="visible"/></clipPath>' +
-        '<path fill="#4a5261" d="M312.3 246.7H277v-33.8c0-3.4 2.8-6.2 6.2-6.2h22.9c3.4 0 6.2 2.8 6.2 6.2v33.8z"' +
-        ' clip-path="url(#b)"/></g><path fill="#8096a1" d="M98.616 10.7h25.8v31.8h-25.8z"/>' +
-        '<path fill="#855c33" d="M41.716 26v44.9l52.3.2V26.2c0-14.4-11.8-26.2-26.2-26.2-14.4 0-26.1 11.6-26.1 26"/>' +
-        '<path fill="#26a6ab" d="M111.516 126.9h-84.1c-26.2 0-37.4-33.3-16.6-49.2l47-35.2h71.3v66.8c0 9.8-7.9 17.6-17.6 17.6"/>' +
-        '<path fill="#42c9c9" d="m17.816 72.5 44.6-33.3-8 30.5z"/>' +
-        '<path fill="#f7f5e8" d="m62.416 39.2 6.1 19.4h-15.8zm12.1 0 9.7 19.4h-15.7z"/>' +
-        '<path fill="#bdd1cf" d="m84.216 58.6-1.7 11.1h-28.1l-1.7-11.1z"/>' +
-        '<path fill="#f7f5e8" d="M102.816 126.9c-2.6-19.3-7.8-42.7-20.1-57.2h-28.2c-12.3 14.5-17.6 37.9-20.1 57.2h68.4z"/>' +
-        '<path fill="#fc9" d="M70.716 39.7h-4.5c-4.7 0-8.5-3.8-8.5-8.5V16.7h21.5v14.5c0 4.7-3.8 8.5-8.5 8.5"/>' +
-        '<path fill="#bdd1cf" d="M55.116 126.9V69.7c9.1 21.4 20.4 47.3 34.2 57.2h-34.2z"/>' +
-        '<path fill="#fc9" d="m68.516 58.6 6-19.4h-12.1z"/>' +
-        '<path fill="#42c9c9" d="M129.116 42.6v39.2l-30.5-39.2z"/>' +
-        '<path fill="#4a5261" d="m190.016 93.4-7.2.1-1.1-6.4c-1-.9-2.2-1.7-3.6-2.2-1.5-.5-3.2-.8-5.1-.8-4.2 0-7.4 1.6' +
-        '-9.7 4.7-2.2 3.1-3.3 7.1-3.3 12v1.7c0 4.9 1.2 8.9 3.5 12 2.3 3.1 5.5 4.6 9.6 4.5 1.9 0 3.7-.3 5.2-.9 1.6-.6' +
-        ' 2.8-1.3 3.7-2.3l.9-6.5 7.2-.1.1 9.6c-1.9 2.3-4.4 4.1-7.4 5.5-3 1.4-6.4 2.1-10.1 2.1-6.5.1-11.8-2.1-16-6.6' +
-        '-4.2-4.5-6.3-10.2-6.4-17.3v-1.6c-.1-7 1.9-12.8 6-17.4 4.1-4.6 9.4-6.9 15.9-6.9 3.7 0 7.1.6 10.2 2 3 1.3 5.5' +
-        ' 3.1 7.5 5.3l.1 9.5zm225.5 7.5c0-5-1.1-9.1-3.2-12.2-2.1-3.1-5.2-4.6-9.3-4.6-4.1 0-7.1 1.6-9.1 4.7s-2.9 7.2' +
-        '-2.9 12.3v.8c0 5.1 1.1 9.2 3.2 12.3 2.1 3.1 5.1 4.6 9.2 4.6s7.2-1.6 9.2-4.8c2-3.1 3-7.2 3-12.3l-.1-.8zm9.7.7' +
-        'c.1 7.1-1.9 13-5.9 17.6-4 4.7-9.3 7-15.9 7.1-6.5.1-11.8-2.2-15.9-6.8s-6.1-10.4-6.2-17.5v-.7c-.1-7 1.9-12.9' +
-        ' 5.9-17.6 4-4.7 9.2-7.1 15.8-7.1 6.6-.1 11.9 2.2 16 6.8s6.2 10.4 6.3 17.5l-.1.7zm25.5-.5 8.2-.1c2.7 0 4.7-.8' +
-        ' 6.1-2.3 1.4-1.5 2-3.4 2-5.7 0-2.3-.7-4.2-2.1-5.7-1.4-1.5-3.5-2.2-6.2-2.2l-8.2.1.2 15.9zm8-23.4c5.5 0 9.9 1.3' +
-        ' 13.2 4.1 3.2 2.8 4.9 6.5 4.9 11.1s-1.5 8.4-4.7 11.2c-3.2 2.8-7.5 4.3-13.1 4.3l-8.2.1.1 10.7 5.2.9v5.8l-20' +
-        ' .2-.1-5.8 5.1-1-.3-34.7-5.2-1-.1-5.9h23.2z"/></svg>'
-
     // Max bytes per AT+CIPSEND. Stay under the firmware's per-send cap so the
-    // multi-KB page (logo included) goes out as several sends on one socket.
+    // multi-KB page goes out as several sends on one socket.
     const CHUNK = 1024
 
     // Sensor table shown on the page. Fed by setSensorValue() from your own
@@ -476,8 +449,8 @@ namespace WiFi {
     let apPasswd = ""
     let apReady = false            // did the last setup actually bring the AP up?
     // Dashboard controls the user sets in the browser, exposed as MakeCode blocks.
-    let ctrlToggle = [false, false]   // t1, t2
-    let ctrlSlider = [0, 0]           // s1, s2 (0-100)
+    let ctrlToggle = [false, false, false]   // A, B, C
+    let ctrlSlider = [0, 0, 0]               // A, B, C (0-100)
     // If no request arrives for this long (ms), assume the viewer vanished (e.g.
     // switched WiFi) leaving a half-open socket that holds the single connection
     // slot. We then close all sockets so a fresh browser can connect again. Must
@@ -637,39 +610,21 @@ namespace WiFi {
     }
 
     /**
-     * State of toggle 1 on the web dashboard (on = true).
+     * State of a web dashboard toggle (on = true).
      */
-    //% block="web toggle 1"
+    //% block="web toggle %which"
     //% group="Web Controls"
-    export function toggle1(): boolean {
-        return ctrlToggle[0]
+    export function toggle(which: WebControl): boolean {
+        return ctrlToggle[which]
     }
 
     /**
-     * State of toggle 2 on the web dashboard (on = true).
+     * Value of a web dashboard slider (0-100).
      */
-    //% block="web toggle 2"
+    //% block="web slider %which"
     //% group="Web Controls"
-    export function toggle2(): boolean {
-        return ctrlToggle[1]
-    }
-
-    /**
-     * Value of slider 1 on the web dashboard (0-100).
-     */
-    //% block="web slider 1"
-    //% group="Web Controls"
-    export function slider1(): number {
-        return ctrlSlider[0]
-    }
-
-    /**
-     * Value of slider 2 on the web dashboard (0-100).
-     */
-    //% block="web slider 2"
-    //% group="Web Controls"
-    export function slider2(): number {
-        return ctrlSlider[1]
+    export function slider(which: WebControl): number {
+        return ctrlSlider[which]
     }
 
     /**
@@ -772,7 +727,7 @@ namespace WiFi {
         return httpResponse("200 OK", "text/html", pageHtml())
     }
 
-    // Parse "/set?t1=1&t2=0&s1=50&s2=75" and update the control variables.
+    // Parse "/set?tA=1&tB=0&tC=1&sA=50&sB=75&sC=10" and update the control vars.
     function applyControls(path: string) {
         let q = path.indexOf("?")
         if (q < 0) return
@@ -782,10 +737,12 @@ namespace WiFi {
             if (eq < 0) continue
             let key = parts[i].substr(0, eq)
             let val = parts[i].substr(eq + 1)
-            if (key == "t1") ctrlToggle[0] = val == "1"
-            else if (key == "t2") ctrlToggle[1] = val == "1"
-            else if (key == "s1") ctrlSlider[0] = clampPct(val)
-            else if (key == "s2") ctrlSlider[1] = clampPct(val)
+            if (key == "tA") ctrlToggle[0] = val == "1"
+            else if (key == "tB") ctrlToggle[1] = val == "1"
+            else if (key == "tC") ctrlToggle[2] = val == "1"
+            else if (key == "sA") ctrlSlider[0] = clampPct(val)
+            else if (key == "sB") ctrlSlider[1] = clampPct(val)
+            else if (key == "sC") ctrlSlider[2] = clampPct(val)
         }
     }
 
@@ -796,10 +753,12 @@ namespace WiFi {
     }
 
     function controlsJson(): string {
-        return "{\"t1\":" + (ctrlToggle[0] ? "1" : "0") +
-            ",\"t2\":" + (ctrlToggle[1] ? "1" : "0") +
-            ",\"s1\":" + ctrlSlider[0] +
-            ",\"s2\":" + ctrlSlider[1] + "}"
+        return "{\"tA\":" + (ctrlToggle[0] ? "1" : "0") +
+            ",\"tB\":" + (ctrlToggle[1] ? "1" : "0") +
+            ",\"tC\":" + (ctrlToggle[2] ? "1" : "0") +
+            ",\"sA\":" + ctrlSlider[0] +
+            ",\"sB\":" + ctrlSlider[1] +
+            ",\"sC\":" + ctrlSlider[2] + "}"
     }
 
     function dataJson(): string {
@@ -825,18 +784,16 @@ namespace WiFi {
     function pageHtml(): string {
         if (cachedPage == "") {
             cachedPage =
-                "<!DOCTYPE html><html lang=\"en\"><head>" +
+                "<!DOCTYPE html><html lang=\"de\"><head>" +
                 "<meta charset=\"utf-8\">" +
                 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
-                "<title>Calliope mini WiFi Log</title><style>" +
-                "body{font-family:\"Roboto\",Helvetica,Arial,sans-serif;margin:0;color:#222}" +
-                ".header-strip{height:10px;background-image:linear-gradient(90deg,#00c800,#3eb6fd)}" +
-                ".header-contents{height:62px;background:#f3f3f3;display:flex;align-items:center}" +
-                ".header-contents a{display:flex;align-items:center}" +
-                ".header-contents svg{width:167px;height:40px;padding:10px 15px}" +
-                ".header-contents h1{font-size:18px;margin:0;font-weight:700;color:#4a5261}" +
+                "<title>Calliope mini WLAN-Log</title><style>" +
+                "body{font-family:\"Roboto\",\"Helvetica Now\",Helvetica,Arial,sans-serif;margin:0;color:#222}" +
+                ".header-strip{height:10px;background:rgba(66,201,201,1)}" +
+                ".header-contents{padding:0 1em}" +
+                "h1{display:block;font-size:2em;margin:.67em 0;font-weight:bold;unicode-bidi:isolate}" +
                 "main{margin:1em}" +
-                "table{border-collapse:collapse;margin-top:1em;width:100%;max-width:32em}" +
+                "table{border-collapse:collapse;width:100%}" +
                 "th,td{border:1px solid #ddd;padding:8px}" +
                 "th{background:#f3f3f3;text-align:left}" +
                 "td.v{text-align:right;font-variant-numeric:tabular-nums}" +
@@ -846,40 +803,55 @@ namespace WiFi {
                 "#charts{display:flex;flex-wrap:wrap;gap:1em;margin-top:1em}" +
                 ".chart{border:1px solid #eee;border-radius:6px;width:420px;max-width:100%}" +
                 "button{cursor:pointer;border-radius:23px;min-height:40px;font-weight:700;font-size:14px;padding:0 18px;border:none;background:rgba(66,201,201,1);color:#fff;margin:.5em 0}" +
-                "#ctrls{margin:0 0 1em;padding-bottom:.5em;border-bottom:1px solid #eee}" +
+                ".top{display:flex;flex-wrap:wrap;gap:1em;align-items:flex-start}" +
+                ".card{border:1px solid #ddd;border-radius:8px;padding:.6em 1em .9em;background:#fafafa}" +
+                ".tablebox{flex:0 0 auto;width:280px;max-width:100%}" +
+                ".tablebox table{margin-top:.3em}" +
+                "#ctrls{flex:0 0 auto;width:280px;max-width:100%}" +
                 "#ctrls h2{font-size:15px;margin:.4em 0;color:#4a5261}" +
-                "#ctrls .row{display:flex;align-items:center;gap:.6em;margin:.5em 0;max-width:32em}" +
+                "#ctrls .row{display:flex;align-items:center;gap:.6em;margin:.7em 0}" +
                 "#ctrls .lbl{width:5em}" +
-                "#ctrls input[type=range]{flex:1}" +
+                "#ctrls input[type=range]{flex:1;min-width:90px}" +
                 "#ctrls .val{width:2.5em;text-align:right;font-variant-numeric:tabular-nums}" +
+                ".switch{position:relative;display:inline-block;width:64px;height:28px;flex:none}" +
+                ".switch input{opacity:0;width:0;height:0}" +
+                ".switch .slider{position:absolute;inset:0;cursor:pointer;background:#bbb;border-radius:28px;transition:.2s}" +
+                ".switch .slider:before{content:\"\";position:absolute;height:22px;width:22px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.3)}" +
+                ".switch .slider:after{content:\"AUS\";position:absolute;right:7px;top:7px;font-size:10px;font-weight:700;color:#fff}" +
+                ".switch input:checked + .slider{background:rgba(66,201,201,1)}" +
+                ".switch input:checked + .slider:before{transform:translateX(36px)}" +
+                ".switch input:checked + .slider:after{content:\"EIN\";left:8px;right:auto}" +
                 "footer{margin:1em;color:#888;font-size:13px}" +
                 "</style></head><body>" +
                 "<header><div class=\"header-strip\"></div>" +
-                "<div class=\"header-contents\"><a href=\"https://calliope.cc\">" + LOGO_SVG + "</a>" +
-                "<h1>Calliope mini WiFi Log</h1></div></header>" +
-                "<main>" +
-                "<section id=\"ctrls\"><h2>Controls</h2>" +
-                "<label class=\"row\"><input type=\"checkbox\" id=\"t1\"><span>Toggle 1</span></label>" +
-                "<label class=\"row\"><input type=\"checkbox\" id=\"t2\"><span>Toggle 2</span></label>" +
-                "<label class=\"row\"><span class=\"lbl\">Slider 1</span><input type=\"range\" min=\"0\" max=\"100\" id=\"s1\"><span id=\"s1v\" class=\"val\">0</span></label>" +
-                "<label class=\"row\"><span class=\"lbl\">Slider 2</span><input type=\"range\" min=\"0\" max=\"100\" id=\"s2\"><span id=\"s2v\" class=\"val\">0</span></label>" +
-                "</section>" +
-                "<table id=\"t\"><tr><th>Sensor</th><th>Value</th></tr></table>" +
-                "<div id=\"last\">Last update: never</div>" +
-                "<button onclick=\"dlCsv()\">Download as CSV</button>" +
+                "<div class=\"header-contents\"><h1>Calliope mini WLAN-Log</h1></div></header>" +
+                "<main><div class=\"top\">" +
+                "<div class=\"tablebox card\">" +
+                "<table id=\"t\"><tr><th>Sensor</th><th>Wert</th></tr></table>" +
+                "<div id=\"last\">Letzte Aktualisierung: nie</div>" +
+                "<button onclick=\"dlCsv()\">Als CSV herunterladen</button>" +
+                "</div>" +
+                "<section id=\"ctrls\" class=\"card\"><h2>Steuerung</h2>" +
+                "<div class=\"row\"><span class=\"lbl\">Schalter A</span><label class=\"switch\"><input type=\"checkbox\" id=\"tA\"><span class=\"slider\"></span></label></div>" +
+                "<div class=\"row\"><span class=\"lbl\">Schalter B</span><label class=\"switch\"><input type=\"checkbox\" id=\"tB\"><span class=\"slider\"></span></label></div>" +
+                "<div class=\"row\"><span class=\"lbl\">Schalter C</span><label class=\"switch\"><input type=\"checkbox\" id=\"tC\"><span class=\"slider\"></span></label></div>" +
+                "<div class=\"row\"><span class=\"lbl\">Regler A</span><input type=\"range\" min=\"0\" max=\"100\" id=\"sA\"><span id=\"sAv\" class=\"val\">0</span></div>" +
+                "<div class=\"row\"><span class=\"lbl\">Regler B</span><input type=\"range\" min=\"0\" max=\"100\" id=\"sB\"><span id=\"sBv\" class=\"val\">0</span></div>" +
+                "<div class=\"row\"><span class=\"lbl\">Regler C</span><input type=\"range\" min=\"0\" max=\"100\" id=\"sC\"><span id=\"sCv\" class=\"val\">0</span></div>" +
+                "</section></div>" +
                 "<div id=\"charts\"></div>" +
-                "<div id=\"status\">connecting...</div></main>" +
-                "<footer>Auto-updating every 2&nbsp;s &middot; served live from the WiFi module</footer>" +
+                "<div id=\"status\">Verbinde...</div></main>" +
+                "<footer>Aktualisiert sich alle 2&nbsp;s &middot; live vom WLAN-Modul</footer>" +
                 "<script>" +
                 "var s=document.getElementById('status'),tbl=document.getElementById('t')," +
                 "last=document.getElementById('last'),charts=document.getElementById('charts');" +
-                "var samples=[],rows={},noPlot={'served.requests':1};" +
+                "var samples=[],rows={},noPlot={'anfragen':1};" +
                 "function vals(k){var a=[],n=samples.length,st=n>60?n-60:0,i;" +
                 "for(i=st;i<n;i++){var v=samples[i].d[k];if(v!==undefined){var f=parseFloat(v);a.push(isNaN(f)?0:f);}}" +
                 "return a;}" +
                 "function dlCsv(){var keys=[],i,k;" +
                 "for(i=0;i<samples.length;i++)for(k in samples[i].d)if(keys.indexOf(k)<0)keys.push(k);" +
-                "var csv='time;'+keys.join(';')+'\\n';" +
+                "var csv='zeit;'+keys.join(';')+'\\n';" +
                 "for(i=0;i<samples.length;i++){var r=samples[i],row=r.t,j;" +
                 "for(j=0;j<keys.length;j++){var v=r.d[keys[j]];row+=';'+(v===undefined?'':v);}" +
                 "csv+=row+'\\n';}" +
@@ -889,7 +861,7 @@ namespace WiFi {
                 "var W=420,H=200,pl=46,pr=10,pt=20,pb=22,gw=W-pl-pr,gh=H-pt-pb,i,j;" +
                 "var s='<svg viewBox=\"0 0 '+W+' '+H+'\" width=\"100%\" style=\"display:block\">';" +
                 "s+='<text x=\"'+pl+'\" y=\"13\" fill=\"#4a5261\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"bold\">'+title+'</text>';" +
-                "if(a.length<2)return s+'<text x=\"'+pl+'\" y=\"'+(H/2)+'\" fill=\"#aaa\" font-family=\"sans-serif\" font-size=\"11\">collecting...</text></svg>';" +
+                "if(a.length<2)return s+'<text x=\"'+pl+'\" y=\"'+(H/2)+'\" fill=\"#aaa\" font-family=\"sans-serif\" font-size=\"11\">sammle Daten...</text></svg>';" +
                 "var mn=Math.min.apply(null,a),mx=Math.max.apply(null,a);if(mn==mx){mn-=1;mx+=1;}" +
                 "function yf(v){return (pt+gh-((v-mn)/(mx-mn))*gh).toFixed(1);}" +
                 "function xf(q){return (pl+q/(a.length-1)*gw).toFixed(1);}" +
@@ -902,7 +874,7 @@ namespace WiFi {
                 "s+='<polyline fill=\"none\" stroke=\"rgba(66,201,201,1)\" stroke-width=\"2\" points=\"'+p+'\"/>';" +
                 "var tk=4;for(i=0;i<=tk;i++){var f=i/tk,xx=(pl+f*gw).toFixed(1),ago=Math.round((1-f)*(a.length-1)*2);" +
                 "s+='<line x1=\"'+xx+'\" y1=\"'+(pt+gh)+'\" x2=\"'+xx+'\" y2=\"'+(pt+gh+3)+'\" stroke=\"#ccc\"/>';" +
-                "s+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'now')+'</text>';}" +
+                "s+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}" +
                 "return s+'</svg>';}" +
                 "async function tick(){try{" +
                 "var resp=await fetch('/data',{cache:'no-store'});var d=await resp.json(),k;" +
@@ -916,19 +888,19 @@ namespace WiFi {
                 "rows[k]={v:vc,b:bx};}" +
                 "rows[k].v.textContent=d[k];" +
                 "if(rows[k].b)rows[k].b.innerHTML=svg(k,vals(k));}" +
-                "last.textContent='Last update: '+now;" +
-                "s.textContent='updated';" +
-                "}catch(e){s.textContent='(waiting for data...)';}}" +
-                "var c1=document.getElementById('t1'),c2=document.getElementById('t2')," +
-                "r1=document.getElementById('s1'),r2=document.getElementById('s2')," +
-                "r1v=document.getElementById('s1v'),r2v=document.getElementById('s2v');" +
-                "function sendCtrl(){fetch('/set?t1='+(c1.checked?1:0)+'&t2='+(c2.checked?1:0)+'&s1='+r1.value+'&s2='+r2.value,{cache:'no-store'});}" +
-                "c1.addEventListener('change',sendCtrl);c2.addEventListener('change',sendCtrl);" +
-                "r1.addEventListener('change',sendCtrl);r2.addEventListener('change',sendCtrl);" +
-                "r1.addEventListener('input',function(){r1v.textContent=r1.value;});" +
-                "r2.addEventListener('input',function(){r2v.textContent=r2.value;});" +
+                "last.textContent='Letzte Aktualisierung: '+now;" +
+                "s.textContent='aktualisiert';" +
+                "}catch(e){s.textContent='(warte auf Daten...)';}}" +
+                "var elT=[document.getElementById('tA'),document.getElementById('tB'),document.getElementById('tC')];" +
+                "var elS=[document.getElementById('sA'),document.getElementById('sB'),document.getElementById('sC')];" +
+                "var elSv=[document.getElementById('sAv'),document.getElementById('sBv'),document.getElementById('sCv')];" +
+                "function sendCtrl(){fetch('/set?tA='+(elT[0].checked?1:0)+'&tB='+(elT[1].checked?1:0)+'&tC='+(elT[2].checked?1:0)+'&sA='+elS[0].value+'&sB='+elS[1].value+'&sC='+elS[2].value,{cache:'no-store'});}" +
+                "elT.forEach(function(e){e.addEventListener('change',sendCtrl);});" +
+                "elS.forEach(function(e,i){e.addEventListener('change',sendCtrl);e.addEventListener('input',function(){elSv[i].textContent=e.value;});});" +
                 "fetch('/controls',{cache:'no-store'}).then(function(r){return r.json();}).then(function(c){" +
-                "c1.checked=c.t1==1;c2.checked=c.t2==1;r1.value=c.s1;r2.value=c.s2;r1v.textContent=c.s1;r2v.textContent=c.s2;});" +
+                "elT[0].checked=c.tA==1;elT[1].checked=c.tB==1;elT[2].checked=c.tC==1;" +
+                "elS[0].value=c.sA;elS[1].value=c.sB;elS[2].value=c.sC;" +
+                "elSv[0].textContent=c.sA;elSv[1].textContent=c.sB;elSv[2].textContent=c.sC;});" +
                 "setInterval(tick,2000);tick();" +
                 "</script></body></html>"
         }
