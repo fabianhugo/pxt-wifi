@@ -536,6 +536,12 @@ namespace WiFi {
             }
         }
 
+        // Short, memorable AP address (default would be 192.168.4.1). Volatile
+        // (SYSSTORE=0), so re-applied on every setup / reboot recovery.
+        sendAtCmd("AT+CIPAP=\"10.0.0.1\",\"10.0.0.1\",\"255.255.255.0\"")
+        waitAtResponse("OK", "ERROR", "None", 2000)
+
+
         // Multiple connections are required for a TCP server.
         sendAtCmd("AT+CIPMUX=1")
         waitAtResponse("OK", "ERROR", "None", 1000)
