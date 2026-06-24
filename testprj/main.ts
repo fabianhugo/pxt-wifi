@@ -35,6 +35,20 @@ basic.forever(() => {
     basic.pause(1000)
 })
 
+// React to the web dashboard controls (set from the browser, read here).
+basic.forever(() => {
+    // Slider 1 (0-100) -> LED display brightness (0-255).
+    led.setBrightness(WiFi.slider1() * 255 / 100)
+    // Toggle 1 lights the centre LED.
+    if (WiFi.toggle1()) {
+        led.plot(2, 2)
+    } else {
+        led.unplot(2, 2)
+    }
+    // Also available: WiFi.toggle2() (boolean) and WiFi.slider2() (0-100).
+    basic.pause(200)
+})
+
 // Press button A to stop the access point (and the background server).
 input.onButtonPressed(Button.A, function () {
     WiFi.stopAccessPoint()

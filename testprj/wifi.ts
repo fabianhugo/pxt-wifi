@@ -6,7 +6,7 @@ enum MessageType {
  * Functions to operate Grove module.
  */
 //% weight=10 color=#9F79EE icon="\uf1b3" block="WiFi"
-//% groups='["UartWiFi", "Access Point"]'
+//% groups='["UartWiFi", "Access Point", "Web Controls"]'
 namespace WiFi {
     /**
      * 
@@ -475,6 +475,9 @@ namespace WiFi {
     let apSsid = ""
     let apPasswd = ""
     let apReady = false            // did the last setup actually bring the AP up?
+    // Dashboard controls the user sets in the browser, exposed as MakeCode blocks.
+    let ctrlToggle = [false, false]   // t1, t2
+    let ctrlSlider = [0, 0]           // s1, s2 (0-100)
     // If no request arrives for this long (ms), assume the viewer vanished (e.g.
     // switched WiFi) leaving a half-open socket that holds the single connection
     // slot. We then close all sockets so a fresh browser can connect again. Must
@@ -634,6 +637,42 @@ namespace WiFi {
     }
 
     /**
+     * State of toggle 1 on the web dashboard (on = true).
+     */
+    //% block="web toggle 1"
+    //% group="Web Controls"
+    export function toggle1(): boolean {
+        return ctrlToggle[0]
+    }
+
+    /**
+     * State of toggle 2 on the web dashboard (on = true).
+     */
+    //% block="web toggle 2"
+    //% group="Web Controls"
+    export function toggle2(): boolean {
+        return ctrlToggle[1]
+    }
+
+    /**
+     * Value of slider 1 on the web dashboard (0-100).
+     */
+    //% block="web slider 1"
+    //% group="Web Controls"
+    export function slider1(): number {
+        return ctrlSlider[0]
+    }
+
+    /**
+     * Value of slider 2 on the web dashboard (0-100).
+     */
+    //% block="web slider 2"
+    //% group="Web Controls"
+    export function slider2(): number {
+        return ctrlSlider[1]
+    }
+
+    /**
      * Set (or update) a sensor reading shown on the web page.
      */
     //% block="Set sensor %name to %value"
@@ -717,6 +756,13 @@ namespace WiFi {
     }
 
     function routeResponse(path: string): string {
+        if (path.indexOf("/set") == 0) {
+            applyControls(path)
+            return httpResponse("200 OK", "text/plain", "ok")
+        }
+        if (path.indexOf("/controls") == 0) {
+            return httpResponse("200 OK", "application/json", controlsJson())
+        }
         if (path.indexOf("/data") == 0) {
             return httpResponse("200 OK", "application/json", dataJson())
         }
@@ -724,6 +770,36 @@ namespace WiFi {
             return httpResponse("204 No Content", "text/plain", "")
         }
         return httpResponse("200 OK", "text/html", pageHtml())
+    }
+
+    // Parse "/set?t1=1&t2=0&s1=50&s2=75" and update the control variables.
+    function applyControls(path: string) {
+        let q = path.indexOf("?")
+        if (q < 0) return
+        let parts = path.substr(q + 1).split("&")
+        for (let i = 0; i < parts.length; i++) {
+            let eq = parts[i].indexOf("=")
+            if (eq < 0) continue
+            let key = parts[i].substr(0, eq)
+            let val = parts[i].substr(eq + 1)
+            if (key == "t1") ctrlToggle[0] = val == "1"
+            else if (key == "t2") ctrlToggle[1] = val == "1"
+            else if (key == "s1") ctrlSlider[0] = clampPct(val)
+            else if (key == "s2") ctrlSlider[1] = clampPct(val)
+        }
+    }
+
+    function clampPct(s: string): number {
+        let n = Math.round(parseFloat(s))
+        if (isNaN(n)) return 0
+        return Math.max(0, Math.min(100, n))
+    }
+
+    function controlsJson(): string {
+        return "{\"t1\":" + (ctrlToggle[0] ? "1" : "0") +
+            ",\"t2\":" + (ctrlToggle[1] ? "1" : "0") +
+            ",\"s1\":" + ctrlSlider[0] +
+            ",\"s2\":" + ctrlSlider[1] + "}"
     }
 
     function dataJson(): string {
@@ -770,12 +846,25 @@ namespace WiFi {
                 "#charts{display:flex;flex-wrap:wrap;gap:1em;margin-top:1em}" +
                 ".chart{border:1px solid #eee;border-radius:6px;width:420px;max-width:100%}" +
                 "button{cursor:pointer;border-radius:23px;min-height:40px;font-weight:700;font-size:14px;padding:0 18px;border:none;background:rgba(66,201,201,1);color:#fff;margin:.5em 0}" +
+                "#ctrls{margin:0 0 1em;padding-bottom:.5em;border-bottom:1px solid #eee}" +
+                "#ctrls h2{font-size:15px;margin:.4em 0;color:#4a5261}" +
+                "#ctrls .row{display:flex;align-items:center;gap:.6em;margin:.5em 0;max-width:32em}" +
+                "#ctrls .lbl{width:5em}" +
+                "#ctrls input[type=range]{flex:1}" +
+                "#ctrls .val{width:2.5em;text-align:right;font-variant-numeric:tabular-nums}" +
                 "footer{margin:1em;color:#888;font-size:13px}" +
                 "</style></head><body>" +
                 "<header><div class=\"header-strip\"></div>" +
                 "<div class=\"header-contents\"><a href=\"https://calliope.cc\">" + LOGO_SVG + "</a>" +
                 "<h1>Calliope mini WiFi Log</h1></div></header>" +
-                "<main><table id=\"t\"><tr><th>Sensor</th><th>Value</th></tr></table>" +
+                "<main>" +
+                "<section id=\"ctrls\"><h2>Controls</h2>" +
+                "<label class=\"row\"><input type=\"checkbox\" id=\"t1\"><span>Toggle 1</span></label>" +
+                "<label class=\"row\"><input type=\"checkbox\" id=\"t2\"><span>Toggle 2</span></label>" +
+                "<label class=\"row\"><span class=\"lbl\">Slider 1</span><input type=\"range\" min=\"0\" max=\"100\" id=\"s1\"><span id=\"s1v\" class=\"val\">0</span></label>" +
+                "<label class=\"row\"><span class=\"lbl\">Slider 2</span><input type=\"range\" min=\"0\" max=\"100\" id=\"s2\"><span id=\"s2v\" class=\"val\">0</span></label>" +
+                "</section>" +
+                "<table id=\"t\"><tr><th>Sensor</th><th>Value</th></tr></table>" +
                 "<div id=\"last\">Last update: never</div>" +
                 "<button onclick=\"dlCsv()\">Download as CSV</button>" +
                 "<div id=\"charts\"></div>" +
@@ -830,6 +919,16 @@ namespace WiFi {
                 "last.textContent='Last update: '+now;" +
                 "s.textContent='updated';" +
                 "}catch(e){s.textContent='(waiting for data...)';}}" +
+                "var c1=document.getElementById('t1'),c2=document.getElementById('t2')," +
+                "r1=document.getElementById('s1'),r2=document.getElementById('s2')," +
+                "r1v=document.getElementById('s1v'),r2v=document.getElementById('s2v');" +
+                "function sendCtrl(){fetch('/set?t1='+(c1.checked?1:0)+'&t2='+(c2.checked?1:0)+'&s1='+r1.value+'&s2='+r2.value,{cache:'no-store'});}" +
+                "c1.addEventListener('change',sendCtrl);c2.addEventListener('change',sendCtrl);" +
+                "r1.addEventListener('change',sendCtrl);r2.addEventListener('change',sendCtrl);" +
+                "r1.addEventListener('input',function(){r1v.textContent=r1.value;});" +
+                "r2.addEventListener('input',function(){r2v.textContent=r2.value;});" +
+                "fetch('/controls',{cache:'no-store'}).then(function(r){return r.json();}).then(function(c){" +
+                "c1.checked=c.t1==1;c2.checked=c.t2==1;r1.value=c.s1;r2.value=c.s2;r1v.textContent=c.s1;r2v.textContent=c.s2;});" +
                 "setInterval(tick,2000);tick();" +
                 "</script></body></html>"
         }
