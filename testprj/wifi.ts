@@ -450,6 +450,13 @@ namespace WiFi {
     // Dashboard controls the user sets in the browser, exposed as MakeCode blocks.
     let ctrlToggle = [false, false, false]   // A, B, C
     let ctrlSlider = [0, 0, 0]               // A, B, C (0-100)
+    let lastRowCount = 0   // total data rows last computed by logRowsCsv; read by routeResponse
+    // Wall-clock sync: browser piggybacks its Unix epoch (seconds) on every /data
+    // poll as "?t=N". We record that value and the device's running time at that
+    // moment so timestamp() can reconstruct the current wall-clock without any RTC.
+    let syncedEpochSec = 0
+    let syncedDeviceMs = 0
+    let timeSynced = false
     // If no request arrives for this long (ms), assume the viewer vanished (e.g.
     // switched WiFi) leaving a half-open socket that holds the single connection
     // slot. We then close all sockets so a fresh browser can connect again. Must
@@ -538,7 +545,7 @@ namespace WiFi {
 
         // Short, memorable AP address (default would be 192.168.4.1). Volatile
         // (SYSSTORE=0), so re-applied on every setup / reboot recovery.
-        sendAtCmd("AT+CIPAP=\"1.1.1.1\",\"1.1.1.1\",\"255.255.255.0\"")
+        sendAtCmd("AT+CIPAP=\"4.3.2.1\",\"4.3.2.1\",\"255.255.255.0\"")
         waitAtResponse("OK", "ERROR", "None", 2000)
 
         // Multiple connections are required for a TCP server.
@@ -634,6 +641,19 @@ namespace WiFi {
         return ctrlSlider[which]
     }
 
+    /**
+     * Current wall-clock time as Unix timestamp (whole seconds since 1 Jan 1970),
+     * synced from the browser when the dashboard first loaded.
+     * Returns 0 before any browser has connected.
+     * Use with datalogger.setTimestamp(Timestamp.None) and log this as a column.
+     */
+    //% block="WiFi timestamp (Unix s)"
+    //% group="Access Point"
+    export function timestamp(): number {
+        if (!timeSynced) return 0
+        return syncedEpochSec + Math.floor((input.runningTime() - syncedDeviceMs) / 1000)
+    }
+
 
     // Handle one pending web request, if any. Called repeatedly by the background
     // server loop (startBackgroundServer); not a user-facing block.
@@ -704,10 +724,6 @@ namespace WiFi {
     }
 
     function routeResponse(path: string): string {
-        if (path.indexOf("/set") == 0) {
-            applyControls(path)
-            return httpResponse("200 OK", "text/plain", "ok")
-        }
         if (path.indexOf("/controls") == 0) {
             return httpResponse("200 OK", "application/json", controlsJson())
         }
@@ -715,7 +731,16 @@ namespace WiFi {
             return httpResponse("200 OK", "text/csv", logFullCsv())   // full log download
         }
         if (path.indexOf("/data") == 0) {
-            return httpResponse("200 OK", "text/csv", logRowsCsv())   // header + last 100 rows
+            // The poll carries everything: the browser piggybacks its Unix time
+            // (t=) and the dashboard control values (tA/sB/...) on every /data
+            // request. Folding controls in here -- instead of a separate /set
+            // request -- means there is only ever one request type in flight, so
+            // a control change can't collide with a poll on the single-socket,
+            // single-fiber server (which previously froze the dashboard).
+            syncTimeFromQuery(path)
+            applyControls(path)
+            let clientFrom = parseQueryInt(path, "from")
+            return httpDataResponse(logRowsCsv(clientFrom))
         }
         if (path.indexOf("/favicon") == 0) {
             return httpResponse("204 No Content", "text/plain", "")
@@ -723,7 +748,9 @@ namespace WiFi {
         return httpResponse("200 OK", "text/html", pageHtml())
     }
 
-    // Parse "/set?tA=1&tB=0&tC=1&sA=50&sB=75&sC=10" and update the control vars.
+    // Parse the control params piggybacked on the /data poll
+    // ("...&tA=1&tB=0&tC=1&sA=50&sB=75&sC=10") and update the control vars.
+    // Unknown keys (from, t) are ignored, so it is safe to call on any /data URL.
     function applyControls(path: string) {
         let q = path.indexOf("?")
         if (q < 0) return
@@ -757,16 +784,72 @@ namespace WiFi {
             ",\"sC\":" + ctrlSlider[2] + "}"
     }
 
+    // Extract an integer query parameter from a path like "/data?from=42".
+    // Returns -1 if the key is absent or unparseable.
+    function parseQueryInt(path: string, key: string): number {
+        let q = path.indexOf("?")
+        if (q < 0) return -1
+        let parts = path.substr(q + 1).split("&")
+        for (let i = 0; i < parts.length; i++) {
+            let eq = parts[i].indexOf("=")
+            if (eq < 0) continue
+            if (parts[i].substr(0, eq) == key) {
+                let n = Math.round(parseFloat(parts[i].substr(eq + 1)))
+                return isNaN(n) ? -1 : n
+            }
+        }
+        return -1
+    }
+
+    // Re-sync the wall-clock from a "t=<unix seconds>" query param if present.
+    // Called on every /data poll, so drift is bounded by the poll interval (~2 s).
+    function syncTimeFromQuery(path: string) {
+        let t = parseQueryInt(path, "t")
+        if (t > 0) {
+            syncedEpochSec = t
+            syncedDeviceMs = input.runningTime()
+            timeSynced = true
+        }
+    }
+
     // Datalogger is the single source. getRows(from, count): header is row 0,
     // getNumberOfRows() includes the header. Returns CSV (commas=cols, \n=rows).
+    // Sets lastRowCount to the client's NEW cursor (the row index it has now seen
+    // up to), which the response reports as X-Row-Count. When the response is
+    // capped this is < the device total, so the client keeps polling to catch up.
 
-    // For the poll: header + up to the last 100 data rows (charts read these).
-    function logRowsCsv(): string {
-        let total = datalogger.getNumberOfRows()    // includes header row 0
-        if (total <= 1) return datalogger.getRows(0, 1)   // header only / empty
-        let from = total - 100
-        if (from < 1) from = 1
-        return datalogger.getRows(0, 1) + "\n" + datalogger.getRows(from, 100)
+    // First connection seeds the chart with this many recent rows. Kept small so
+    // the very first poll (the slow "warte auf Daten" wait) returns quickly.
+    const SEED_ROWS = 50
+
+    // Hard cap on rows returned per /data poll. A client that fell behind (e.g. a
+    // connection gap while toggling) then catches up over several polls instead of
+    // pulling one big burst -- large responses stress the module and were a likely
+    // crash trigger. 50 matches the seed, so no single response exceeds it.
+    const MAX_ROWS_PER_POLL = 50
+
+    // For the poll: clientFrom == -1 (first connection) returns header + last
+    // SEED_ROWS data rows; clientFrom >= 0 returns only the rows after that index
+    // (diff), capped at MAX_ROWS_PER_POLL. Empty body means already up to date.
+    function logRowsCsv(clientFrom: number): string {
+        let total = datalogger.getNumberOfRows()   // includes header row 0
+        let totalData = total - 1
+        if (total <= 1) { lastRowCount = 0; return "" }
+        let startData: number
+        if (clientFrom < 0) {
+            // First connection: seed with the last SEED_ROWS data rows
+            startData = totalData - SEED_ROWS
+            if (startData < 0) startData = 0
+        } else {
+            // Diff: only rows the client hasn't seen yet
+            if (clientFrom >= totalData) { lastRowCount = totalData; return "" }
+            startData = clientFrom
+        }
+        let count = totalData - startData
+        if (count > MAX_ROWS_PER_POLL) count = MAX_ROWS_PER_POLL
+        lastRowCount = startData + count   // client's new cursor (may be < totalData)
+        let startIdx = startData + 1       // +1 because row 0 is the header
+        return datalogger.getRows(0, 1) + "\n" + datalogger.getRows(startIdx, count)
     }
 
     // For the download: the entire log.
@@ -784,6 +867,17 @@ namespace WiFi {
             "Content-Length: " + body.length + "\r\n" +
             "Cache-Control: no-cache\r\n" +
             "X-Log-Full: " + (logFull ? "1" : "0") + "\r\n" +
+            "Connection: keep-alive\r\n\r\n" + body
+    }
+
+    // Like httpResponse but adds X-Row-Count for the browser's diff offset tracking.
+    function httpDataResponse(body: string): string {
+        return "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/csv; charset=utf-8\r\n" +
+            "Content-Length: " + body.length + "\r\n" +
+            "Cache-Control: no-cache\r\n" +
+            "X-Log-Full: " + (logFull ? "1" : "0") + "\r\n" +
+            "X-Row-Count: " + lastRowCount + "\r\n" +
             "Connection: keep-alive\r\n\r\n" + body
     }
 
@@ -848,21 +942,35 @@ namespace WiFi {
                 "<div class=\"row\"><span class=\"lbl\">Regler C</span><input type=\"range\" min=\"0\" max=\"100\" id=\"sC\"><span id=\"sCv\" class=\"val\">0</span></div>" +
                 "</section></div>" +
                 "<div id=\"charts\"></div>" +
-                "<div id=\"status\">Verbinde...</div></main>" +
+                "<div id=\"status\">warte auf Daten...</div></main>" +
                 "<footer>Aktualisiert sich alle 2&nbsp;s &middot; live vom WLAN-Modul</footer>" +
                 "<script>" +
                 "var s=document.getElementById('status'),tbl=document.getElementById('t')," +
                 "lu=document.getElementById('last'),charts=document.getElementById('charts')," +
                 "full=document.getElementById('full');" +
-                "var cols=[],rowEls=[];" +
+                "var cols=[],rowEls=[],rows=[],offset=-1;" +
+                "var inflight=false,ctrlReady=false,downloading=false;" +
                 "function build(h){cols=h;for(var ci=0;ci<h.length;ci++){" +
                 "var tr=tbl.insertRow();tr.insertCell().textContent=h[ci];" +
                 "var vc=tr.insertCell();vc.className='v';" +
                 "var bx=document.createElement('div');bx.className='chart';charts.appendChild(bx);" +
                 "rowEls.push({v:vc,b:bx});}}" +
-                "function dlCsv(){fetch('/log.csv',{cache:'no-store'}).then(function(r){return r.text();}).then(function(t){" +
+                // The full-log download is a big response. It must NOT run next to
+                // the /data poll: the single-fiber server can't serve two sockets at
+                // once (the browser opens a 2nd connection and gets REFUSED/EMPTY).
+                // So pause polling, wait out any in-flight poll, then fetch with the
+                // socket to ourselves. A 30s abort keeps a stalled download from
+                // freezing the page; polling resumes (and catches up) either way.
+                "async function dlCsv(){if(downloading)return;downloading=true;s.textContent='lade CSV...';" +
+                "var ac=new AbortController(),tmo=setTimeout(function(){ac.abort();},30000);try{" +
+                "while(inflight)await new Promise(function(r){setTimeout(r,50);});" +
+                "var resp=await fetch('/log.csv',{cache:'no-store',signal:ac.signal});" +
+                "var t=await resp.text();" +
                 "var a=document.createElement('a');a.download='calliope-log.csv';" +
-                "a.href=URL.createObjectURL(new Blob([t.replace(/,/g,';')],{type:'text/csv'}));a.click();});}" +
+                "a.href=URL.createObjectURL(new Blob([t.replace(/,/g,';')],{type:'text/csv'}));a.click();" +
+                "s.textContent='CSV geladen';" +
+                "}catch(e){s.textContent='CSV-Download fehlgeschlagen';}" +
+                "finally{clearTimeout(tmo);downloading=false;}}" +
                 "function svg(title,a){" +
                 "var W=420,H=200,pl=46,pr=10,pt=20,pb=22,gw=W-pl-pr,gh=H-pt-pb,i,j;" +
                 "var s='<svg viewBox=\"0 0 '+W+' '+H+'\" width=\"100%\" style=\"display:block\">';" +
@@ -882,33 +990,49 @@ namespace WiFi {
                 "s+='<line x1=\"'+xx+'\" y1=\"'+(pt+gh)+'\" x2=\"'+xx+'\" y2=\"'+(pt+gh+3)+'\" stroke=\"#ccc\"/>';" +
                 "s+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}" +
                 "return s+'</svg>';}" +
-                "async function tick(){try{" +
-                "var resp=await fetch('/data',{cache:'no-store'});" +
+                "function ctrlQ(){return '&tA='+(elT[0].checked?1:0)+'&tB='+(elT[1].checked?1:0)+'&tC='+(elT[2].checked?1:0)+'&sA='+elS[0].value+'&sB='+elS[1].value+'&sC='+elS[2].value;}" +
+                "async function tick(){if(inflight||downloading)return;inflight=true;" +
+                "var ac=new AbortController(),tmo=setTimeout(function(){ac.abort();},5000);try{" +
+                "var ts=Math.floor(Date.now()/1000);" +
+                "var url=(offset<0?'/data?t='+ts:'/data?from='+offset+'&t='+ts)+(ctrlReady?ctrlQ():'');" +
+                "var resp=await fetch(url,{cache:'no-store',signal:ac.signal});" +
                 "full.style.display=(resp.headers.get('X-Log-Full')=='1')?'':'none';" +
+                "var rc=parseInt(resp.headers.get('X-Row-Count')||'-1');" +
+                // Row count went backwards -> the device restarted/reset its log.
+                // Our buffered rows are now stale; drop them and reseed next poll.
+                "if(rc>=0&&offset>=0&&rc<offset){console.log('reset: Neustart erkannt rc='+rc+' offset='+offset);rows.length=0;offset=-1;return;}" +
                 "var t=await resp.text();" +
-                "var L=t.replace(/\\r/g,'').split('\\n'),R=[],li;" +
-                "for(li=0;li<L.length;li++)if(L[li].length)R.push(L[li].split(','));" +
-                "if(!R.length){s.textContent='(warte auf Daten...)';return;}" +
-                "if(!cols.length)build(R[0]);" +
-                "if(R.length<2){s.textContent='(warte auf Daten...)';return;}" +
-                "var last=R[R.length-1],ci;" +
+                "var L=t.replace(/\\r/g,'').split('\\n'),nr=[],li;" +
+                "for(li=0;li<L.length;li++)if(L[li].length)nr.push(L[li].split(','));" +
+                "if(rc>=0)offset=rc;" +
+                "if(!cols.length&&nr.length)build(nr[0]);" +
+                "for(var ri=1;ri<nr.length;ri++)rows.push(nr[ri]);" +
+                "if(rows.length>500)rows.splice(0,rows.length-500);" +
+                "console.log('poll: X-Row-Count='+rc+' neueZeilen='+(nr.length>0?nr.length-1:0)+' offset='+offset+' puffer='+rows.length);" +
+                "if(!rows.length){s.textContent='(warte auf Daten...)';return;}" +
+                "var d=rows.slice(-100),last=d[d.length-1],ci;" +
                 "for(ci=0;ci<cols.length;ci++){if(!rowEls[ci])continue;" +
                 "rowEls[ci].v.textContent=last[ci]!==undefined?last[ci]:'';" +
-                "var arr=[],ri;for(ri=1;ri<R.length;ri++){var f=parseFloat(R[ri][ci]);arr.push(isNaN(f)?0:f);}" +
+                "var arr=[],di;for(di=0;di<d.length;di++){var f=parseFloat(d[di][ci]);arr.push(isNaN(f)?0:f);}" +
                 "rowEls[ci].b.innerHTML=svg(cols[ci],arr);}" +
                 "lu.textContent='Letzte Aktualisierung: '+new Date().toLocaleString();" +
                 "s.textContent='aktualisiert';" +
-                "}catch(e){s.textContent='(warte auf Daten...)';}}" +
+                "}catch(e){s.textContent='(warte auf Daten...)';}" +
+                "finally{clearTimeout(tmo);inflight=false;}}" +
                 "var elT=[document.getElementById('tA'),document.getElementById('tB'),document.getElementById('tC')];" +
                 "var elS=[document.getElementById('sA'),document.getElementById('sB'),document.getElementById('sC')];" +
                 "var elSv=[document.getElementById('sAv'),document.getElementById('sBv'),document.getElementById('sCv')];" +
-                "function sendCtrl(){fetch('/set?tA='+(elT[0].checked?1:0)+'&tB='+(elT[1].checked?1:0)+'&tC='+(elT[2].checked?1:0)+'&sA='+elS[0].value+'&sB='+elS[1].value+'&sC='+elS[2].value,{cache:'no-store'});}" +
-                "elT.forEach(function(e){e.addEventListener('change',sendCtrl);});" +
-                "elS.forEach(function(e,i){e.addEventListener('change',sendCtrl);e.addEventListener('input',function(){elSv[i].textContent=e.value;});});" +
+                // Controls ride along on the next /data poll (no separate request,
+                // so no collision with polling). Flipping a control triggers an
+                // immediate tick() for snappy response; the inflight guard keeps
+                // it from overlapping the periodic poll.
+                "elT.forEach(function(e){e.addEventListener('change',tick);});" +
+                "elS.forEach(function(e,i){e.addEventListener('change',tick);e.addEventListener('input',function(){elSv[i].textContent=e.value;});});" +
                 "fetch('/controls',{cache:'no-store'}).then(function(r){return r.json();}).then(function(c){" +
                 "elT[0].checked=c.tA==1;elT[1].checked=c.tB==1;elT[2].checked=c.tC==1;" +
                 "elS[0].value=c.sA;elS[1].value=c.sB;elS[2].value=c.sC;" +
-                "elSv[0].textContent=c.sA;elSv[1].textContent=c.sB;elSv[2].textContent=c.sC;});" +
+                "elSv[0].textContent=c.sA;elSv[1].textContent=c.sB;elSv[2].textContent=c.sC;" +
+                "ctrlReady=true;});" +
                 "setInterval(tick,2000);tick();" +
                 "</script></body></html>"
         }
@@ -942,6 +1066,9 @@ namespace WiFi {
 
     // Read & discard until the link is quiet for idleMs (or maxMs elapses), so
     // we don't issue AT+CIPSEND while the module is still forwarding the request.
+    // The basic.pause(5) is essential: without it this is a tight busy-loop that
+    // never yields, starving the user's datalogger.log()/sensor fiber so no new
+    // rows get logged (the dashboard then shows frozen values while still polling).
     function drainIdle(idleMs: number, maxMs: number) {
         let last = input.runningTime()
         let start = last
@@ -952,6 +1079,7 @@ namespace WiFi {
             } else if (input.runningTime() - last >= idleMs) {
                 return
             }
+            basic.pause(5)   // yield to other fibers (logging/sensors)
         }
     }
 
