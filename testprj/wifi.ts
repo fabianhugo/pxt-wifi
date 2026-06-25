@@ -558,12 +558,12 @@ namespace WiFi {
         sendAtCmd("AT+CIPSTO=10")
         waitAtResponse("OK", "ERROR", "None", 1000)
 
-        // Effectively one viewer, but allow 2 connections: browsers (notably
-        // Firefox) open a 2nd/backup socket while the slow multi-chunk page is
-        // still loading, and a single slot refuses it -> intermittent load
-        // failures. Two slots give headroom; keep-alive still means no per-poll
-        // churn. (Must be set before the server is created.)
-        sendAtCmd("AT+CIPSERVERMAXCONN=2")
+        // Allow the maximum number of simultaneous connections the AT firmware
+        // supports (CIPMUX link ids 0-4 = 5 sockets). Removes the previous 2-slot
+        // cap so a browser opening extra/backup sockets, or a stale half-open
+        // socket, can't exhaust the slots and get refused. (Must be set before the
+        // server is created.)
+        sendAtCmd("AT+CIPSERVERMAXCONN=5")
         waitAtResponse("OK", "ERROR", "None", 1000)
 
         // Start the TCP server on port 80 (retry; ERROR may mean "already
