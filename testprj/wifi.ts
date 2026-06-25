@@ -436,7 +436,6 @@ namespace WiFi {
     let rxBuf = ""
     let cachedPage = ""
     let lastRequestTime = 0
-    let webRecovered = false
     let serverRunning = false      // background server loop should keep running
     let loopRunning = false        // background server loop is currently alive
     // Remembered AP config so the server can re-run setup after a module reboot
@@ -576,7 +575,6 @@ namespace WiFi {
         }
 
         lastRequestTime = input.runningTime()
-        webRecovered = false
     }
 
     // Serve web requests automatically in the background once the AP is started,
@@ -706,20 +704,21 @@ namespace WiFi {
         drainIdle(150, 1500)             // let the module finish forwarding the request
         serveResponse(linkId, routeResponse(path))
         lastRequestTime = input.runningTime()
-        webRecovered = false
     }
 
     // If no request has arrived for a while, a viewer probably left (e.g. switched
-    // WiFi) leaving a half-open socket that holds the single connection slot, so
-    // new browsers get refused. Close all sockets to free the slot. Fires once per
-    // idle episode (reset when the next real request arrives).
+    // WiFi or closed the tab) leaving a half-open socket that holds a connection
+    // slot, so new browsers get refused. Close all sockets to free the slots.
+    // This RE-FIRES every idle period (not just once): a browser that closes can
+    // leave a fresh half-open socket behind, and a single close may not clear it,
+    // so we keep reaping until a new browser actually connects. Fixes "can't
+    // reconnect after closing the dashboard". An active dashboard polls every ~2 s
+    // so it never goes idle long enough to trip this.
     function webWatchdog() {
-        if (webRecovered) return
         if (input.runningTime() - lastRequestTime > IDLE_RECOVER_MS) {
             sendAtCmd("AT+CIPCLOSE=5")          // link id 5 = all connections
             waitAtResponse("CLOSED", "OK", "ERROR", 1000)
-            webRecovered = true
-            lastRequestTime = input.runningTime()
+            lastRequestTime = input.runningTime()   // throttle: re-fire after another idle period
         }
     }
 
