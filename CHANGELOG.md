@@ -8,14 +8,82 @@ This work began from a dashboard that re-sent **all 100 most-recent log rows on
 every 2-second poll** and evolved into an incremental (diff) streaming dashboard
 with bidirectional controls, wall-clock sync, and a number of stability fixes.
 
-> **File scope.** The earlier features (diff streaming, timestamp sync, control
-> piggybacking) were applied to **both** `main.ts` and `testprj/wifi.ts`. The
-> later stability/robustness fixes (everything from "Stability & performance"
-> onward) were applied to **`testprj/wifi.ts` only**, at the user's request, and
-> still need to be ported to `main.ts`. See "Pending port to main.ts" below.
+> **File scope.** `main.ts` and `testprj/wifi.ts` are now byte-identical: every
+> feature and stability fix below (diff streaming, timestamp sync, control
+> piggybacking, the per-poll cap, regression guard, watchdog re-fire,
+> `CIPSERVERMAXCONN=5`, the "Empfangene Pakete" field, and the slider fix) is
+> present in both.
+
+### Added — multiple sensor nodes (push to hub)
+
+Several Calliope+WiFi minis can now feed one hub dashboard. Each **node** joins
+the hub's WiFi in station mode (`WiFi.setupWifi` / "Setup Wifi") and pushes a row
+of readings; the **hub** logs each pushed row (tagged with the node name) and the
+dashboard draws **one chart line per node**. The hub stays the only server; nodes
+are plain short-lived HTTP clients (`GET /push?node=B&temp=..&light=..`).
+
+- **Hub: `/push` ingest route.** Parses `key=value` pairs from the query into
+  datalogger columns and logs them (`datalogger.logData`). `node=` identifies the
+  sender. The hub's `setColumnTitles` must include `"node"` + the sensor names.
+- **Node: `WiFi.pushToHub(node, ...createCV)` block** (group *Sensor Node*), plus
+  `WiFi.setHubAddress(host)` (default `4.3.2.1`). Mirrors the `datalogger.log`
+  block — same `createCV` slots. Opens a TCP connection, sends the row, closes it
+  (so it never holds one of the hub's connection slots). Percent-encodes values.
+- **Dashboard groups by node.** When a `node` column is present the table becomes
+  *Node × sensors* (latest per node) and each sensor gets a multi-series chart
+  with a coloured legend. With **no** `node` column the dashboard is byte-for-byte
+  the original single-source layout (zero change / zero regression risk).
+- **Download is unchanged:** "Als CSV herunterladen" gives the hub's combined
+  session log (all nodes interleaved). Each node's *complete* full-resolution log
+  remains available losslessly over **USB** (`MY_DATA.HTM`) — the hub's flash is a
+  bounded session view, not the master archive (it fills ~N× faster with N nodes).
+
+Example **node** program (a second mini called "B"):
+
+```ts
+// Join the hub's WiFi (station mode). SSID must match the hub's AP.
+WiFi.setupWifi(SerialPin.C17, SerialPin.C16, BaudRate.BaudRate115200, "CalliopeHub", "")
+WiFi.setHubAddress("4.3.2.1")
+datalogger.setColumnTitles("temp", "light", "sound")   // node's own local log
+basic.forever(function () {
+    datalogger.log(                                    // keep a full local log (USB download)
+        datalogger.createCV("temp", input.temperature()),
+        datalogger.createCV("light", input.lightLevel()),
+        datalogger.createCV("sound", input.soundLevel())
+    )
+    WiFi.pushToHub("B",                                // ...and push the same row to the hub
+        datalogger.createCV("temp", input.temperature()),
+        datalogger.createCV("light", input.lightLevel()),
+        datalogger.createCV("sound", input.soundLevel())
+    )
+    basic.pause(2000)
+})
+```
+
+> **Stability note.** Each push is connection open→send→close churn — the exact
+> load the hub's stability work fights. A handful of nodes pushing every ~2 s is
+> fine; many nodes pushing fast increases module heap pressure and reboot risk.
+> If crashes increase, slow the node push interval before anything else.
+
+- **Fixed error 022 (`GC_TOO_BIG_ALLOCATION`) on every page load.** The multi-node
+  UI grew the dashboard page from ~9.1 KB to ~12.7 KB (+~40%), and assembling it
+  as one string no longer fit a single contiguous free block on the fragmented
+  heap — so it failed while *building* the page, before it could be sent. Fix: the
+  page is now stored as ~190 small string segments (largest ~180 B) and **never
+  concatenated into one big string**; `servePage` streams the segments in
+  ≤CHUNK packets, so total page size no longer matters for this error class.
+  Likewise `/log.csv` streams in 20-row batches (two passes: measure length, then
+  send) instead of materialising the whole log at once. Headers are sent as their
+  own packet so no response ever allocates a full-size duplicate.
 
 ### Added
 
+- **"Empfangene Pakete" field.** A line under the table shows the total number of
+  rows recorded on the device. (It used to be a table row; it moved to its own
+  line so the table can be freely rebuilt in multi-node mode.) The count rides on
+  the regular `/data` poll via a new `X-Total-Rows` response header (the device's
+  true total, independent of the client's diff cursor), so it stays correct even
+  while a client is catching up.
 - **Incremental ("diff") data streaming.** `/data` now accepts a `?from=N` query
   param and returns only the rows the client has not yet seen, plus an
   `X-Row-Count` response header telling the client its new cursor. The first poll
@@ -66,6 +134,10 @@ with bidirectional controls, wall-clock sync, and a number of stability fixes.
 
 ### Fixed
 
+- **Sliders started in the middle.** The `Regler A/B/C` range inputs had no
+  `value` attribute, so browsers defaulted the thumb to the midpoint (50) while
+  the displayed value and the device-side state were 0. Added `value="0"` so the
+  thumb starts at the left, matching the 0 it reports.
 - **Dashboard freeze when flipping a toggle.** The old separate `/set` request
   collided with the concurrent `/data` poll in the single-fiber server's RX
   buffer, mangling the parse and hanging the page. Folding controls into `/data`
@@ -78,19 +150,13 @@ with bidirectional controls, wall-clock sync, and a number of stability fixes.
   the single-fiber server couldn't serve (`ERR_EMPTY_RESPONSE` /
   `ERR_CONNECTION_REFUSED`); now serialized with polling. *(testprj/wifi.ts)*
 
-### Pending port to main.ts
+### Ported to main.ts
 
-`main.ts` currently has the diff streaming, timestamp sync, and control
-piggybacking, but **not** the later stability fixes. Still to port:
-
-- `SEED_ROWS = 50` and the "warte auf Daten..." status text
-- 5 s poll `AbortController` + removal of the `pending` re-fire
-- `drainIdle()` yield (`basic.pause(5)`)
-- CSV download serialization
-- `MAX_ROWS_PER_POLL` cap + client regression guard
-- watchdog re-fire (remove `webRecovered`)
-- `AT+CIPSERVERMAXCONN=5`
-- (decide whether to keep the per-poll `console.log` debug line)
+All of the stability fixes have now been ported, so `main.ts` ≡ `testprj/wifi.ts`:
+`SEED_ROWS = 50` + "warte auf Daten..." text, the 5 s poll `AbortController`,
+`drainIdle()` yield, CSV download serialization, `MAX_ROWS_PER_POLL` + client
+regression guard, watchdog re-fire (`webRecovered` removed), and
+`AT+CIPSERVERMAXCONN=5`. The per-poll `console.log` debug line was kept.
 
 ### Known issues / notes
 

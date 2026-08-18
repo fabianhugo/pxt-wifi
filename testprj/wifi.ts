@@ -16,7 +16,7 @@ enum WebControl {
  * Functions to operate Grove module.
  */
 //% weight=10 color=#9F79EE icon="\uf1b3" block="WiFi"
-//% groups='["UartWiFi", "Access Point", "Web Controls"]'
+//% groups='["UartWiFi", "Access Point", "Web Controls", "Sensor Node"]'
 namespace WiFi {
     /**
      * 
@@ -45,8 +45,16 @@ namespace WiFi {
             BaudRate.BaudRate115200
         )
 
-        sendAtCmd("AT")
-        result = waitAtResponse("OK", "ERROR", "None", 1000)
+        // Wait until the module actually answers AT before configuring. On a cold
+        // boot the WiFi module powers up together with the Calliope and may still
+        // be booting, so the first commands -- including the join -- get lost.
+        // Retry for up to ~12 s; returns as soon as the module responds.
+        let ready = false
+        for (let i = 0; i < 40 && !ready; i++) {
+            sendAtCmd("AT")
+            if (waitAtResponse("OK", "ERROR", "None", 300) == 1) ready = true
+            else basic.pause(200)
+        }
 
         sendAtCmd("AT+SYSSTORE=0")
         result = waitAtResponse("OK", "ERROR", "FAIL", 3000)
@@ -73,11 +81,15 @@ namespace WiFi {
         sendAtCmd("AT+CWMODE=1")
         result = waitAtResponse("OK", "ERROR", "None", 1000)
 
-        sendAtCmd(`AT+CWJAP="${ssid}","${passwd}"`)
-        result = waitAtResponse("WIFI GOT IP", "ERROR", "None", 20000)
-
-        if (result == 1) {
-            isWifiConnected = true
+        // Join the network, retried -- right after boot the first attempt can fail
+        // even though AT already answers.
+        for (let attempt = 0; attempt < 3 && !isWifiConnected; attempt++) {
+            sendAtCmd(`AT+CWJAP="${ssid}","${passwd}"`)
+            if (waitAtResponse("WIFI GOT IP", "ERROR", "None", 20000) == 1) {
+                isWifiConnected = true
+            } else {
+                basic.pause(500)
+            }
         }
     }
 
@@ -236,6 +248,7 @@ namespace WiFi {
 
         while ((input.runningTime() - start) < timeout) {
             buffer += serial.readString()
+            lastAt = buffer                   // remember the raw reply for diagnostics
 
             if (buffer.includes(target1)) return 1
             if (buffer.includes(target2)) return 2
@@ -434,7 +447,7 @@ namespace WiFi {
     // logs rows with datalogger.log(...); the driver serves them via getRows.
     let logFull = false            // set by datalogger.onLogFull -> page banner
     let rxBuf = ""
-    let cachedPage = ""
+    let pageSegs: string[] = []
     let lastRequestTime = 0
     let serverRunning = false      // background server loop should keep running
     let loopRunning = false        // background server loop is currently alive
@@ -449,13 +462,22 @@ namespace WiFi {
     // Dashboard controls the user sets in the browser, exposed as MakeCode blocks.
     let ctrlToggle = [false, false, false]   // A, B, C
     let ctrlSlider = [0, 0, 0]               // A, B, C (0-100)
-    let lastRowCount = 0   // total data rows last computed by logRowsCsv; read by routeResponse
+    let lastRowCount = 0   // client's new cursor (rows it has seen); reported as X-Row-Count
+    let lastTotalRows = 0  // total data rows logged on the device; reported as X-Total-Rows
     // Wall-clock sync: browser piggybacks its Unix epoch (seconds) on every /data
     // poll as "?t=N". We record that value and the device's running time at that
     // moment so timestamp() can reconstruct the current wall-clock without any RTC.
     let syncedEpochSec = 0
     let syncedDeviceMs = 0
     let timeSynced = false
+    // Address of the hub access point a sensor node pushes to (see pushToHub).
+    // Matches the AT+CIPAP address the hub sets in doApSetup.
+    let hubHost = "4.3.2.1"
+    // Diagnostic: where the last pushToHub got to. 0 = ok, 1 = could not connect
+    // (CIPSTART), 2 = no send prompt (CIPSEND), 3 = send not acknowledged.
+    let pushStage = 0
+    // Diagnostic: the raw text of the most recent AT reply (set by waitAtResponse).
+    let lastAt = ""
     // If no request arrives for this long (ms), assume the viewer vanished (e.g.
     // switched WiFi) leaving a half-open socket that holds the single connection
     // slot. We then close all sockets so a fresh browser can connect again. Must
@@ -546,6 +568,14 @@ namespace WiFi {
         // (SYSSTORE=0), so re-applied on every setup / reboot recovery.
         sendAtCmd("AT+CIPAP=\"4.3.2.1\",\"4.3.2.1\",\"255.255.255.0\"")
         waitAtResponse("OK", "ERROR", "None", 2000)
+
+        // Advertise the dashboard as "calliope.local" via mDNS, so devices that
+        // resolve .local names (iOS/macOS, Windows) can use the name instead of
+        // the IP. Harmless if the firmware lacks mDNS -- it just answers ERROR and
+        // we ignore it; 4.3.2.1 stays the reliable fallback (Android often can't
+        // resolve .local). Must run after the SoftAP IP is set.
+        sendAtCmd("AT+MDNS=1,\"calliope\",\"_http\",80")
+        waitAtResponse("OK", "ERROR", "None", 1000)
 
         // Multiple connections are required for a TCP server.
         sendAtCmd("AT+CIPMUX=1")
@@ -653,6 +683,142 @@ namespace WiFi {
     }
 
 
+    // =========================================================================
+    // Sensor node: push readings to the hub
+    //
+    // A second (third, ...) Calliope joins the hub's WiFi in station mode (use
+    // "Setup Wifi" with the hub's SSID) and sends one row of readings to the hub
+    // with pushToHub(). The hub logs each pushed row (tagged with the node name)
+    // and the dashboard draws one chart line per node. The node stays a plain
+    // HTTP client -- the hub remains the only server.
+    // =========================================================================
+
+    /**
+     * Set the hub's IP address that pushToHub sends to (default 4.3.2.1).
+     */
+    //% block="hub address %host"
+    //% host.defl="4.3.2.1"
+    //% group="Sensor Node"
+    export function setHubAddress(host: string) {
+        hubHost = host
+    }
+
+    /**
+     * Where the last pushToHub got to (for diagnosing a failed push):
+     * 0 = ok, 1 = could not connect to the hub, 2 = no send prompt,
+     * 3 = data sent but not acknowledged.
+     */
+    //% block="last push status"
+    //% group="Sensor Node"
+    export function pushStatus(): number {
+        return pushStage
+    }
+
+    /**
+     * The raw text of the most recent AT reply (CR/LF flattened to spaces), for
+     * diagnosing a failed push -- e.g. show it with "show string".
+     */
+    //% block="last AT reply"
+    //% group="Sensor Node"
+    export function lastResponse(): string {
+        let out = ""
+        for (let i = 0; i < lastAt.length; i++) {
+            let c = lastAt.charAt(i)
+            if (c == "\r" || c == "\n") out += " "
+            else out += c
+        }
+        return out
+    }
+
+    /**
+     * Send one row of readings to the hub access point. Join the hub's WiFi
+     * first with "Setup Wifi" (station mode). "node" names this sender so the
+     * hub charts each node separately; the other values become columns. Returns
+     * true if the hub accepted the row.
+     */
+    //% block="push to hub as node $node $data1||$data2 $data3 $data4 $data5"
+    //% blockId=wifipushtohub
+    //% node.defl="B"
+    //% data1.shadow=dataloggercreatecolumnvalue
+    //% data2.shadow=dataloggercreatecolumnvalue
+    //% data3.shadow=dataloggercreatecolumnvalue
+    //% data4.shadow=dataloggercreatecolumnvalue
+    //% data5.shadow=dataloggercreatecolumnvalue
+    //% inlineInputMode="variable"
+    //% inlineInputModeLimit=1
+    //% group="Sensor Node"
+    export function pushToHub(node: string, data1: datalogger.ColumnValue, data2?: datalogger.ColumnValue, data3?: datalogger.ColumnValue, data4?: datalogger.ColumnValue, data5?: datalogger.ColumnValue): boolean {
+        let cvs = [data1, data2, data3, data4, data5].filter(el => !!el)
+        let query = "node=" + urlEncode(node)
+        for (let i = 0; i < cvs.length; i++) {
+            query += "&" + urlEncode(cvs[i].column) + "=" + urlEncode(cvs[i].value)
+        }
+        return pushQuery(query)
+    }
+
+    // Open a short-lived TCP connection to the hub and send GET /push?<query>.
+    // Single-connection mode (CIPMUX=0), like the ThingSpeak/Adafruit clients.
+    // Always closes its own socket so the hub's connection slots aren't held.
+    function pushQuery(query: string): boolean {
+        let ok = false
+        // Clear any stale connection first. The WiFi module has no reset line, so
+        // it keeps TCP state across Calliope resets/reflashes -- a connection left
+        // open by a previous run makes the next CIPSTART report "CLOSED" and fail.
+        sendAtCmd("AT+CIPCLOSE")
+        waitAtResponse("OK", "ERROR", "CLOSED", 1000)
+        // Client side uses single-connection mode (no link id on CIPSTART/CIPSEND).
+        // A node left in CIPMUX=1 by a previous program would reject these, so
+        // force 0. (Safe: pushQuery always closes its socket, so none is active.)
+        sendAtCmd("AT+CIPMUX=0")
+        waitAtResponse("OK", "ERROR", "None", 1000)
+        pushStage = 1                         // 1 = couldn't connect (until proven otherwise)
+        let retry = 2
+        while (retry > 0 && !ok) {
+            retry--
+            // Connect. Accept OK or ALREADY CONNECTED; on ERROR/timeout retry
+            // (the old code fell through to CIPSEND on a timeout, sending into a
+            // socket that was never established).
+            sendAtCmd("AT+CIPSTART=\"TCP\",\"" + hubHost + "\",80")
+            let r = waitAtResponse("OK", "ALREADY CONNECTED", "ERROR", 5000)
+            if (r != 1 && r != 2) { basic.pause(300); continue }
+            pushStage = 2                     // connected; now sending
+            let req = "GET /push?" + query + " HTTP/1.1\r\nHost: " + hubHost + "\r\nConnection: close\r\n\r\n"
+            sendAtCmd("AT+CIPSEND=" + req.length)
+            r = waitAtResponse(">", "ERROR", "busy", 3000)
+            if (r != 1) {
+                sendAtCmd("AT+CIPCLOSE")
+                waitAtResponse("OK", "ERROR", "CLOSED", 1000)
+                continue
+            }
+            pushStage = 3                     // got the send prompt; writing data
+            serial.writeString(req)
+            r = waitAtResponse("SEND OK", "SEND FAIL", "ERROR", 5000)
+            sendAtCmd("AT+CIPCLOSE")
+            waitAtResponse("OK", "ERROR", "CLOSED", 1000)
+            if (r == 1) { ok = true; pushStage = 0 }
+        }
+        return ok
+    }
+
+    // Minimal percent-encoding for query values (node names, column titles,
+    // numeric values). Encodes the characters that would break a query string.
+    function urlEncode(s: string): string {
+        let out = ""
+        for (let i = 0; i < s.length; i++) {
+            let c = s.charAt(i)
+            if (c == " ") out += "%20"
+            else if (c == "&") out += "%26"
+            else if (c == "=") out += "%3D"
+            else if (c == "+") out += "%2B"
+            else if (c == "%") out += "%25"
+            else if (c == "#") out += "%23"
+            else if (c == "?") out += "%3F"
+            else out += c
+        }
+        return out
+    }
+
+
     // Handle one pending web request, if any. Called repeatedly by the background
     // server loop (startBackgroundServer); not a user-facing block.
     function handleWebRequests() {
@@ -702,7 +868,7 @@ namespace WiFi {
 
         rxBuf = ""
         drainIdle(150, 1500)             // let the module finish forwarding the request
-        serveResponse(linkId, routeResponse(path))
+        serveRequest(linkId, path)
         lastRequestTime = input.runningTime()
     }
 
@@ -741,10 +907,63 @@ namespace WiFi {
             let clientFrom = parseQueryInt(path, "from")
             return httpDataResponse(logRowsCsv(clientFrom))
         }
+        if (path.indexOf("/push") == 0) {
+            // A sensor node delivered a row of readings (see pushToHub).
+            return httpResponse("200 OK", "text/plain", ingestPush(path))
+        }
         if (path.indexOf("/favicon") == 0) {
             return httpResponse("204 No Content", "text/plain", "")
         }
-        return httpResponse("200 OK", "text/html", pageHtml())
+        return httpResponse("404 Not Found", "text/plain", "")
+    }
+
+    // A sensor node sends a row as GET /push?node=B&temp=21.4&light=120 . Each
+    // key=value pair becomes a logged column (node= identifies the sender), so
+    // the dashboard can chart each node as its own line. The hub's
+    // setColumnTitles should include "node" plus the sensor names the nodes send.
+    function ingestPush(path: string): string {
+        let q = path.indexOf("?")
+        if (q < 0) return "no data"
+        let parts = path.substr(q + 1).split("&")
+        let cvs: datalogger.ColumnValue[] = []
+        for (let i = 0; i < parts.length; i++) {
+            let eq = parts[i].indexOf("=")
+            if (eq < 0) continue
+            let key = urlDecode(parts[i].substr(0, eq))
+            if (key.length == 0) continue
+            let val = urlDecode(parts[i].substr(eq + 1))
+            cvs.push(datalogger.createCV(key, val))
+        }
+        if (cvs.length == 0) return "no data"
+        datalogger.logData(cvs)
+        return "ok"
+    }
+
+    function urlDecode(s: string): string {
+        let out = ""
+        let i = 0
+        while (i < s.length) {
+            let c = s.charAt(i)
+            if (c == "+") {
+                out += " "
+                i++
+            } else if (c == "%" && i + 2 < s.length) {
+                out += String.fromCharCode(hexVal(s.charAt(i + 1)) * 16 + hexVal(s.charAt(i + 2)))
+                i += 3
+            } else {
+                out += c
+                i++
+            }
+        }
+        return out
+    }
+
+    function hexVal(c: string): number {
+        let n = c.charCodeAt(0)
+        if (n >= 48 && n <= 57) return n - 48        // 0-9
+        if (n >= 97 && n <= 102) return n - 87       // a-f
+        if (n >= 65 && n <= 70) return n - 55        // A-F
+        return 0
     }
 
     // Parse the control params piggybacked on the /data poll
@@ -833,6 +1052,7 @@ namespace WiFi {
     function logRowsCsv(clientFrom: number): string {
         let total = datalogger.getNumberOfRows()   // includes header row 0
         let totalData = total - 1
+        lastTotalRows = totalData > 0 ? totalData : 0   // total recorded rows -> X-Total-Rows
         if (total <= 1) { lastRowCount = 0; return "" }
         let startData: number
         if (clientFrom < 0) {
@@ -877,165 +1097,327 @@ namespace WiFi {
             "Cache-Control: no-cache\r\n" +
             "X-Log-Full: " + (logFull ? "1" : "0") + "\r\n" +
             "X-Row-Count: " + lastRowCount + "\r\n" +
+            "X-Total-Rows: " + lastTotalRows + "\r\n" +
             "Connection: keep-alive\r\n\r\n" + body
     }
 
-    function pageHtml(): string {
-        if (cachedPage == "") {
-            cachedPage =
-                "<!DOCTYPE html><html lang=\"de\"><head>" +
-                "<meta charset=\"utf-8\">" +
-                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
-                "<title>Calliope mini WLAN-Log</title><style>" +
-                "body{font-family:\"Roboto\",\"Helvetica Now\",Helvetica,Arial,sans-serif;margin:0;color:#222}" +
-                ".header-strip{height:10px;background:rgba(66,201,201,1)}" +
-                ".header-contents{padding:0 1em}" +
-                "h1{display:block;font-size:2em;margin:.67em 0;font-weight:bold;unicode-bidi:isolate}" +
-                "main{margin:1em}" +
-                "table{border-collapse:collapse;width:100%}" +
-                "th,td{border:1px solid #ddd;padding:8px}" +
-                "th{background:#f3f3f3;text-align:left}" +
-                "td.v{text-align:right;font-variant-numeric:tabular-nums}" +
-                "tr:nth-child(even){background:#f2f2f2}" +
-                "#last{color:#555;font-size:13px;margin:.75em 0}" +
-                "#status{color:#888;font-size:13px}" +
-                "#full{display:none;color:#c00;font-weight:700;font-size:13px;margin:.3em 0}" +
-                "#charts{display:flex;flex-wrap:wrap;gap:1em;margin-top:1em}" +
-                ".chart{border:1px solid #eee;border-radius:6px;width:420px;max-width:100%}" +
-                "button{cursor:pointer;border-radius:23px;min-height:40px;font-weight:700;font-size:14px;padding:0 18px;border:none;background:rgba(66,201,201,1);color:#fff;margin:.5em 0}" +
-                ".top{display:flex;flex-wrap:wrap;gap:1em;align-items:flex-start}" +
-                ".card{border:1px solid #ddd;border-radius:8px;padding:.6em 1em .9em;background:#fafafa}" +
-                ".tablebox{flex:0 0 auto;width:280px;max-width:100%}" +
-                ".tablebox table{margin-top:.3em}" +
-                "#ctrls{flex:0 0 auto;width:280px;max-width:100%}" +
-                "#ctrls h2{font-size:15px;margin:.4em 0;color:#4a5261}" +
-                "#ctrls .row{display:flex;align-items:center;gap:.6em;margin:.7em 0}" +
-                "#ctrls .lbl{width:5em}" +
-                "#ctrls input[type=range]{flex:1;min-width:90px}" +
-                "#ctrls .val{width:2.5em;text-align:right;font-variant-numeric:tabular-nums}" +
-                ".switch{position:relative;display:inline-block;width:64px;height:28px;flex:none}" +
-                ".switch input{opacity:0;width:0;height:0}" +
-                ".switch .slider{position:absolute;inset:0;cursor:pointer;background:#bbb;border-radius:28px;transition:.2s}" +
-                ".switch .slider:before{content:\"\";position:absolute;height:22px;width:22px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.3)}" +
-                ".switch .slider:after{content:\"AUS\";position:absolute;right:7px;top:7px;font-size:10px;font-weight:700;color:#fff}" +
-                ".switch input:checked + .slider{background:rgba(66,201,201,1)}" +
-                ".switch input:checked + .slider:before{transform:translateX(36px)}" +
-                ".switch input:checked + .slider:after{content:\"EIN\";left:8px;right:auto}" +
-                "footer{margin:1em;color:#888;font-size:13px}" +
-                "</style></head><body>" +
-                "<header><div class=\"header-strip\"></div>" +
-                "<div class=\"header-contents\"><h1>Calliope mini WLAN-Log</h1></div></header>" +
-                "<main><div class=\"top\">" +
-                "<div class=\"tablebox card\">" +
-                "<table id=\"t\"><tr><th>Sensor</th><th>Wert</th></tr></table>" +
-                "<div id=\"last\">Letzte Aktualisierung: nie</div>" +
-                "<div id=\"full\">Log voll!</div>" +
-                "<button onclick=\"dlCsv()\">Als CSV herunterladen</button>" +
-                "</div>" +
-                "<section id=\"ctrls\" class=\"card\"><h2>Steuerung</h2>" +
-                "<div class=\"row\"><span class=\"lbl\">Schalter A</span><label class=\"switch\"><input type=\"checkbox\" id=\"tA\"><span class=\"slider\"></span></label></div>" +
-                "<div class=\"row\"><span class=\"lbl\">Schalter B</span><label class=\"switch\"><input type=\"checkbox\" id=\"tB\"><span class=\"slider\"></span></label></div>" +
-                "<div class=\"row\"><span class=\"lbl\">Schalter C</span><label class=\"switch\"><input type=\"checkbox\" id=\"tC\"><span class=\"slider\"></span></label></div>" +
-                "<div class=\"row\"><span class=\"lbl\">Regler A</span><input type=\"range\" min=\"0\" max=\"100\" id=\"sA\"><span id=\"sAv\" class=\"val\">0</span></div>" +
-                "<div class=\"row\"><span class=\"lbl\">Regler B</span><input type=\"range\" min=\"0\" max=\"100\" id=\"sB\"><span id=\"sBv\" class=\"val\">0</span></div>" +
-                "<div class=\"row\"><span class=\"lbl\">Regler C</span><input type=\"range\" min=\"0\" max=\"100\" id=\"sC\"><span id=\"sCv\" class=\"val\">0</span></div>" +
-                "</section></div>" +
-                "<div id=\"charts\"></div>" +
-                "<div id=\"status\">warte auf Daten...</div></main>" +
-                "<footer>Aktualisiert sich alle 2&nbsp;s &middot; live vom WLAN-Modul</footer>" +
-                "<script>" +
-                "var s=document.getElementById('status'),tbl=document.getElementById('t')," +
-                "lu=document.getElementById('last'),charts=document.getElementById('charts')," +
-                "full=document.getElementById('full');" +
-                "var cols=[],rowEls=[],rows=[],offset=-1;" +
-                "var inflight=false,ctrlReady=false,downloading=false;" +
-                "function build(h){cols=h;for(var ci=0;ci<h.length;ci++){" +
-                "var tr=tbl.insertRow();tr.insertCell().textContent=h[ci];" +
-                "var vc=tr.insertCell();vc.className='v';" +
-                "var bx=document.createElement('div');bx.className='chart';charts.appendChild(bx);" +
-                "rowEls.push({v:vc,b:bx});}}" +
+    // The dashboard page is stored as many small string segments and is NEVER
+    // assembled into one big string -- a single ~14 KB allocation is what tripped
+    // error 022 (GC_TOO_BIG_ALLOCATION) on the fragmented heap. servePage streams
+    // these segments in CHUNK-sized packets, so total page size no longer matters.
+    function buildPage() {
+        if (pageSegs.length == 0) {
+            pageSegs = [
+                "<!DOCTYPE html><html lang=\"de\"><head>",
+                "<meta charset=\"utf-8\">",
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+                "<title>Calliope mini WLAN-Log</title><style>",
+                "body{font-family:\"Roboto\",\"Helvetica Now\",Helvetica,Arial,sans-serif;margin:0;color:#222}",
+                ".header-strip{height:10px;background:rgba(66,201,201,1)}",
+                ".header-contents{padding:0 1em}",
+                "h1{display:block;font-size:2em;margin:.67em 0;font-weight:bold;unicode-bidi:isolate}",
+                "main{margin:1em}",
+                "table{border-collapse:collapse;width:100%}",
+                "th,td{border:1px solid #ddd;padding:8px}",
+                "th{background:#f3f3f3;text-align:left}",
+                "td.v{text-align:right;font-variant-numeric:tabular-nums}",
+                "tr:nth-child(even){background:#f2f2f2}",
+                "#last{color:#555;font-size:13px;margin:.75em 0}",
+                "#meta{color:#555;font-size:13px;margin:.5em 0}",
+                "#status{color:#888;font-size:13px}",
+                "#full{display:none;color:#c00;font-weight:700;font-size:13px;margin:.3em 0}",
+                "#charts{display:flex;flex-wrap:wrap;gap:1em;margin-top:1em}",
+                ".chart{border:1px solid #eee;border-radius:6px;width:420px;max-width:100%}",
+                "button{cursor:pointer;border-radius:23px;min-height:40px;font-weight:700;font-size:14px;padding:0 18px;border:none;background:rgba(66,201,201,1);color:#fff;margin:.5em 0}",
+                ".top{display:flex;flex-wrap:wrap;gap:1em;align-items:flex-start}",
+                ".card{border:1px solid #ddd;border-radius:8px;padding:.6em 1em .9em;background:#fafafa}",
+                ".tablebox{flex:1 1 320px;min-width:280px;max-width:100%}",
+                ".tablebox table{margin-top:.3em}",
+                "#ctrls{flex:0 0 auto;width:280px;max-width:100%}",
+                "#ctrls h2{font-size:15px;margin:.4em 0;color:#4a5261}",
+                "#ctrls .row{display:flex;align-items:center;gap:.6em;margin:.7em 0}",
+                "#ctrls .lbl{width:5em}",
+                "#ctrls input[type=range]{flex:1;min-width:90px}",
+                "#ctrls .val{width:2.5em;text-align:right;font-variant-numeric:tabular-nums}",
+                ".switch{position:relative;display:inline-block;width:64px;height:28px;flex:none}",
+                ".switch input{opacity:0;width:0;height:0}",
+                ".switch .slider{position:absolute;inset:0;cursor:pointer;background:#bbb;border-radius:28px;transition:.2s}",
+                ".switch .slider:before{content:\"\";position:absolute;height:22px;width:22px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.3)}",
+                ".switch .slider:after{content:\"AUS\";position:absolute;right:7px;top:7px;font-size:10px;font-weight:700;color:#fff}",
+                ".switch input:checked + .slider{background:rgba(66,201,201,1)}",
+                ".switch input:checked + .slider:before{transform:translateX(36px)}",
+                ".switch input:checked + .slider:after{content:\"EIN\";left:8px;right:auto}",
+                "footer{margin:1em;color:#888;font-size:13px}",
+                "</style></head><body>",
+                "<header><div class=\"header-strip\"></div>",
+                "<div class=\"header-contents\"><h1>Calliope mini WLAN-Log</h1></div></header>",
+                "<main><div class=\"top\">",
+                "<div class=\"tablebox card\">",
+                "<table id=\"t\"><tr><th>Sensor</th><th>Wert</th></tr></table>",
+                "<div id=\"meta\">Empfangene Pakete: <span id=\"pkts\">0</span></div>",
+                "<div id=\"last\">Letzte Aktualisierung: nie</div>",
+                "<div id=\"full\">Log voll!</div>",
+                "<button onclick=\"dlCsv()\">Als CSV herunterladen</button>",
+                "</div>",
+                "<section id=\"ctrls\" class=\"card\"><h2>Steuerung</h2>",
+                "<div class=\"row\"><span class=\"lbl\">Schalter A</span><label class=\"switch\"><input type=\"checkbox\" id=\"tA\"><span class=\"slider\"></span></label></div>",
+                "<div class=\"row\"><span class=\"lbl\">Schalter B</span><label class=\"switch\"><input type=\"checkbox\" id=\"tB\"><span class=\"slider\"></span></label></div>",
+                "<div class=\"row\"><span class=\"lbl\">Schalter C</span><label class=\"switch\"><input type=\"checkbox\" id=\"tC\"><span class=\"slider\"></span></label></div>",
+                "<div class=\"row\"><span class=\"lbl\">Regler A</span><input type=\"range\" min=\"0\" max=\"100\" value=\"0\" id=\"sA\"><span id=\"sAv\" class=\"val\">0</span></div>",
+                "<div class=\"row\"><span class=\"lbl\">Regler B</span><input type=\"range\" min=\"0\" max=\"100\" value=\"0\" id=\"sB\"><span id=\"sBv\" class=\"val\">0</span></div>",
+                "<div class=\"row\"><span class=\"lbl\">Regler C</span><input type=\"range\" min=\"0\" max=\"100\" value=\"0\" id=\"sC\"><span id=\"sCv\" class=\"val\">0</span></div>",
+                "</section></div>",
+                "<div id=\"charts\"></div>",
+                "<div id=\"status\">warte auf Daten...</div></main>",
+                "<footer>Aktualisiert sich alle 2&nbsp;s &middot; live vom WLAN-Modul</footer>",
+                "<script>",
+                "var s=document.getElementById('status'),tbl=document.getElementById('t'),",
+                "lu=document.getElementById('last'),charts=document.getElementById('charts'),",
+                "full=document.getElementById('full'),pk=document.getElementById('pkts');",
+                "var cols=[],rowEls=[],rows=[],offset=-1;",
+                "var inflight=false,ctrlReady=false,downloading=false;",
+                // Multi-node: when the data has a "node" column, each row is tagged
+                // with its sender and the dashboard groups by node (one chart line
+                // per node). nodeIx<0 means single-source mode (original layout).
+                "var nodeIx=-1,senIx=[],chB=[];",
+                "var PAL=['#42c9c9','#e8743b','#19a979','#945ecf','#cc3c5d','#d39c00'];",
+                "function build(h){cols=h;",
+                "for(var k=0;k<h.length;k++)if(h[k].toLowerCase()=='node')nodeIx=k;",
+                "if(nodeIx<0){",
+                // Single-source: one table row + one chart per column (original).
+                "for(var ci=0;ci<h.length;ci++){",
+                "var tr=tbl.insertRow();tr.insertCell().textContent=h[ci];",
+                "var vc=tr.insertCell();vc.className='v';",
+                "var bx=document.createElement('div');bx.className='chart';charts.appendChild(bx);",
+                "rowEls.push({v:vc,b:bx});}",
+                "}else{",
+                // Multi-node: one chart per sensor column (skip node + any time
+                // column); the table is rebuilt each tick as Node x sensors.
+                "for(var c2=0;c2<h.length;c2++){",
+                "if(c2==nodeIx||h[c2].toLowerCase().indexOf('time')==0)continue;",
+                "senIx.push(c2);",
+                "var b2=document.createElement('div');b2.className='chart';charts.appendChild(b2);chB.push(b2);}",
+                "}}",
                 // The full-log download is a big response. It must NOT run next to
                 // the /data poll: the single-fiber server can't serve two sockets at
                 // once (the browser opens a 2nd connection and gets REFUSED/EMPTY).
                 // So pause polling, wait out any in-flight poll, then fetch with the
                 // socket to ourselves. A 30s abort keeps a stalled download from
                 // freezing the page; polling resumes (and catches up) either way.
-                "async function dlCsv(){if(downloading)return;downloading=true;s.textContent='lade CSV...';" +
-                "var ac=new AbortController(),tmo=setTimeout(function(){ac.abort();},30000);try{" +
-                "while(inflight)await new Promise(function(r){setTimeout(r,50);});" +
-                "var resp=await fetch('/log.csv',{cache:'no-store',signal:ac.signal});" +
-                "var t=await resp.text();" +
-                "var a=document.createElement('a');a.download='calliope-log.csv';" +
-                "a.href=URL.createObjectURL(new Blob([t.replace(/,/g,';')],{type:'text/csv'}));a.click();" +
-                "s.textContent='CSV geladen';" +
-                "}catch(e){s.textContent='CSV-Download fehlgeschlagen';}" +
-                "finally{clearTimeout(tmo);downloading=false;}}" +
-                "function svg(title,a){" +
-                "var W=420,H=200,pl=46,pr=10,pt=20,pb=22,gw=W-pl-pr,gh=H-pt-pb,i,j;" +
-                "var s='<svg viewBox=\"0 0 '+W+' '+H+'\" width=\"100%\" style=\"display:block\">';" +
-                "s+='<text x=\"'+pl+'\" y=\"13\" fill=\"#4a5261\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"bold\">'+title+'</text>';" +
-                "if(a.length<2)return s+'<text x=\"'+pl+'\" y=\"'+(H/2)+'\" fill=\"#aaa\" font-family=\"sans-serif\" font-size=\"11\">sammle Daten...</text></svg>';" +
-                "var mn=Math.min.apply(null,a),mx=Math.max.apply(null,a);if(mn==mx){mn-=1;mx+=1;}" +
-                "function yf(v){return (pt+gh-((v-mn)/(mx-mn))*gh).toFixed(1);}" +
-                "function xf(q){return (pl+q/(a.length-1)*gw).toFixed(1);}" +
-                "s+='<path d=\"M'+pl+' '+pt+'L'+pl+' '+(pt+gh)+'L'+(pl+gw)+' '+(pt+gh)+'\" fill=\"none\" stroke=\"#ccc\"/>';" +
-                "var yl=[mx,(mx+mn)/2,mn];" +
-                "for(j=0;j<3;j++){var yy=yf(yl[j]);" +
-                "s+='<line x1=\"'+pl+'\" y1=\"'+yy+'\" x2=\"'+(pl+gw)+'\" y2=\"'+yy+'\" stroke=\"#eee\"/>';" +
-                "s+='<text x=\"2\" y=\"'+(+yy+3)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"10\">'+yl[j].toFixed(1)+'</text>';}" +
-                "var p='';for(i=0;i<a.length;i++)p+=xf(i)+','+yf(a[i])+' ';" +
-                "s+='<polyline fill=\"none\" stroke=\"rgba(66,201,201,1)\" stroke-width=\"2\" points=\"'+p+'\"/>';" +
-                "var tk=4;for(i=0;i<=tk;i++){var f=i/tk,xx=(pl+f*gw).toFixed(1),ago=Math.round((1-f)*(a.length-1)*2);" +
-                "s+='<line x1=\"'+xx+'\" y1=\"'+(pt+gh)+'\" x2=\"'+xx+'\" y2=\"'+(pt+gh+3)+'\" stroke=\"#ccc\"/>';" +
-                "s+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}" +
-                "return s+'</svg>';}" +
-                "function ctrlQ(){return '&tA='+(elT[0].checked?1:0)+'&tB='+(elT[1].checked?1:0)+'&tC='+(elT[2].checked?1:0)+'&sA='+elS[0].value+'&sB='+elS[1].value+'&sC='+elS[2].value;}" +
-                "async function tick(){if(inflight||downloading)return;inflight=true;" +
-                "var ac=new AbortController(),tmo=setTimeout(function(){ac.abort();},5000);try{" +
-                "var ts=Math.floor(Date.now()/1000);" +
-                "var url=(offset<0?'/data?t='+ts:'/data?from='+offset+'&t='+ts)+(ctrlReady?ctrlQ():'');" +
-                "var resp=await fetch(url,{cache:'no-store',signal:ac.signal});" +
-                "full.style.display=(resp.headers.get('X-Log-Full')=='1')?'':'none';" +
-                "var rc=parseInt(resp.headers.get('X-Row-Count')||'-1');" +
+                "async function dlCsv(){if(downloading)return;downloading=true;s.textContent='lade CSV...';",
+                "var ac=new AbortController(),tmo=setTimeout(function(){ac.abort();},30000);try{",
+                "while(inflight)await new Promise(function(r){setTimeout(r,50);});",
+                "var resp=await fetch('/log.csv',{cache:'no-store',signal:ac.signal});",
+                "var t=await resp.text();",
+                "var a=document.createElement('a');a.download='calliope-log.csv';",
+                "a.href=URL.createObjectURL(new Blob([t.replace(/,/g,';')],{type:'text/csv'}));a.click();",
+                "s.textContent='CSV geladen';",
+                "}catch(e){s.textContent='CSV-Download fehlgeschlagen';}",
+                "finally{clearTimeout(tmo);downloading=false;}}",
+                "function svg(title,a){",
+                "var W=420,H=200,pl=46,pr=10,pt=20,pb=22,gw=W-pl-pr,gh=H-pt-pb,i,j;",
+                "var s='<svg viewBox=\"0 0 '+W+' '+H+'\" width=\"100%\" style=\"display:block\">';",
+                "s+='<text x=\"'+pl+'\" y=\"13\" fill=\"#4a5261\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"bold\">'+title+'</text>';",
+                "if(a.length<2)return s+'<text x=\"'+pl+'\" y=\"'+(H/2)+'\" fill=\"#aaa\" font-family=\"sans-serif\" font-size=\"11\">sammle Daten...</text></svg>';",
+                "var mn=Math.min.apply(null,a),mx=Math.max.apply(null,a);if(mn==mx){mn-=1;mx+=1;}",
+                "function yf(v){return (pt+gh-((v-mn)/(mx-mn))*gh).toFixed(1);}",
+                "function xf(q){return (pl+q/(a.length-1)*gw).toFixed(1);}",
+                "s+='<path d=\"M'+pl+' '+pt+'L'+pl+' '+(pt+gh)+'L'+(pl+gw)+' '+(pt+gh)+'\" fill=\"none\" stroke=\"#ccc\"/>';",
+                "var yl=[mx,(mx+mn)/2,mn];",
+                "for(j=0;j<3;j++){var yy=yf(yl[j]);",
+                "s+='<line x1=\"'+pl+'\" y1=\"'+yy+'\" x2=\"'+(pl+gw)+'\" y2=\"'+yy+'\" stroke=\"#eee\"/>';",
+                "s+='<text x=\"2\" y=\"'+(+yy+3)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"10\">'+yl[j].toFixed(1)+'</text>';}",
+                "var p='';for(i=0;i<a.length;i++)p+=xf(i)+','+yf(a[i])+' ';",
+                "s+='<polyline fill=\"none\" stroke=\"rgba(66,201,201,1)\" stroke-width=\"2\" points=\"'+p+'\"/>';",
+                "var tk=4;for(i=0;i<=tk;i++){var f=i/tk,xx=(pl+f*gw).toFixed(1),ago=Math.round((1-f)*(a.length-1)*2);",
+                "s+='<line x1=\"'+xx+'\" y1=\"'+(pt+gh)+'\" x2=\"'+xx+'\" y2=\"'+(pt+gh+3)+'\" stroke=\"#ccc\"/>';",
+                "s+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}",
+                "return s+'</svg>';}",
+                // Multi-series chart: one labelled, coloured line per node.
+                "function svgM(title,series){",
+                "var W=420,H=210,pl=46,pr=10,pt=22,pb=22,gw=W-pl-pr,gh=H-pt-pb,i,k;",
+                "var o='<svg viewBox=\"0 0 '+W+' '+H+'\" width=\"100%\" style=\"display:block\">';",
+                "o+='<text x=\"'+pl+'\" y=\"13\" fill=\"#4a5261\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"bold\">'+title+'</text>';",
+                "var all=[];for(k=0;k<series.length;k++)for(i=0;i<series[k].v.length;i++)all.push(series[k].v[i]);",
+                "if(all.length<2)return o+'<text x=\"'+pl+'\" y=\"'+(H/2)+'\" fill=\"#aaa\" font-family=\"sans-serif\" font-size=\"11\">sammle Daten...</text></svg>';",
+                "var mn=Math.min.apply(null,all),mx=Math.max.apply(null,all);if(mn==mx){mn-=1;mx+=1;}",
+                "var ml=2;for(k=0;k<series.length;k++)if(series[k].v.length>ml)ml=series[k].v.length;",
+                "function yf(val){return (pt+gh-((val-mn)/(mx-mn))*gh).toFixed(1);}",
+                "function xf(q,len){return (pl+(len<2?gw:q/(len-1)*gw)).toFixed(1);}",
+                "o+='<path d=\"M'+pl+' '+pt+'L'+pl+' '+(pt+gh)+'L'+(pl+gw)+' '+(pt+gh)+'\" fill=\"none\" stroke=\"#ccc\"/>';",
+                "var yl=[mx,(mx+mn)/2,mn];",
+                "for(i=0;i<3;i++){var yy=yf(yl[i]);",
+                "o+='<line x1=\"'+pl+'\" y1=\"'+yy+'\" x2=\"'+(pl+gw)+'\" y2=\"'+yy+'\" stroke=\"#eee\"/>';",
+                "o+='<text x=\"2\" y=\"'+(+yy+3)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"10\">'+yl[i].toFixed(1)+'</text>';}",
+                "for(k=0;k<series.length;k++){var a=series[k].v,p='';for(i=0;i<a.length;i++)p+=xf(i,a.length)+','+yf(a[i])+' ';",
+                "o+='<polyline fill=\"none\" stroke=\"'+series[k].c+'\" stroke-width=\"2\" points=\"'+p+'\"/>';}",
+                "var tk=4;for(i=0;i<=tk;i++){var f=i/tk,xx=(pl+f*gw).toFixed(1),ago=Math.round((1-f)*(ml-1)*2);",
+                "o+='<line x1=\"'+xx+'\" y1=\"'+(pt+gh)+'\" x2=\"'+xx+'\" y2=\"'+(pt+gh+3)+'\" stroke=\"#ccc\"/>';",
+                "o+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}",
+                "var lx=pl+4;for(k=0;k<series.length;k++){",
+                "o+='<rect x=\"'+lx+'\" y=\"'+(pt-9)+'\" width=\"9\" height=\"9\" fill=\"'+series[k].c+'\"/>';",
+                "o+='<text x=\"'+(lx+12)+'\" y=\"'+(pt-1)+'\" fill=\"#555\" font-family=\"sans-serif\" font-size=\"10\">'+series[k].n+'</text>';",
+                "lx+=22+series[k].n.length*6;}",
+                "return o+'</svg>';}",
+                // Render the Node x sensors table and one per-sensor chart (a line
+                // per node) from the buffered rows. Used when nodeIx>=0.
+                "function renderN(){var seen={},nodes=[],i,j,k;",
+                "for(i=0;i<rows.length;i++){var nv=rows[i][nodeIx];if(nv!==undefined&&seen[nv]===undefined){seen[nv]=1;nodes.push(nv);}}",
+                "if(!nodes.length)return;",
+                "var h='<tr><th>Node</th>';for(j=0;j<senIx.length;j++)h+='<th>'+cols[senIx[j]]+'</th>';h+='</tr>';",
+                "for(k=0;k<nodes.length;k++){var r=null;for(i=rows.length-1;i>=0;i--){if(rows[i][nodeIx]==nodes[k]){r=rows[i];break;}}",
+                "h+='<tr><td>'+nodes[k]+'</td>';",
+                "for(j=0;j<senIx.length;j++){var ci=senIx[j];h+='<td class=\"v\">'+((r&&r[ci]!==undefined)?r[ci]:'')+'</td>';}h+='</tr>';}",
+                "tbl.innerHTML=h;",
+                "var win=rows.slice(-400);",
+                "for(j=0;j<senIx.length;j++){var c2=senIx[j],series=[];",
+                "for(k=0;k<nodes.length;k++){var v=[];",
+                "for(i=0;i<win.length;i++){if(win[i][nodeIx]!=nodes[k])continue;var fv=parseFloat(win[i][c2]);if(!isNaN(fv))v.push(fv);}",
+                "series.push({n:nodes[k],c:PAL[k%PAL.length],v:v});}",
+                "chB[j].innerHTML=svgM(cols[c2],series);}}",
+                "function ctrlQ(){return '&tA='+(elT[0].checked?1:0)+'&tB='+(elT[1].checked?1:0)+'&tC='+(elT[2].checked?1:0)+'&sA='+elS[0].value+'&sB='+elS[1].value+'&sC='+elS[2].value;}",
+                "async function tick(){if(inflight||downloading)return;inflight=true;",
+                "var ac=new AbortController(),tmo=setTimeout(function(){ac.abort();},5000);try{",
+                "var ts=Math.floor(Date.now()/1000);",
+                "var url=(offset<0?'/data?t='+ts:'/data?from='+offset+'&t='+ts)+(ctrlReady?ctrlQ():'');",
+                "var resp=await fetch(url,{cache:'no-store',signal:ac.signal});",
+                "full.style.display=(resp.headers.get('X-Log-Full')=='1')?'':'none';",
+                "var tot=resp.headers.get('X-Total-Rows');if(tot!=null)pk.textContent=tot;",
+                "var rc=parseInt(resp.headers.get('X-Row-Count')||'-1');",
                 // Row count went backwards -> the device restarted/reset its log.
                 // Our buffered rows are now stale; drop them and reseed next poll.
-                "if(rc>=0&&offset>=0&&rc<offset){console.log('reset: Neustart erkannt rc='+rc+' offset='+offset);rows.length=0;offset=-1;return;}" +
-                "var t=await resp.text();" +
-                "var L=t.replace(/\\r/g,'').split('\\n'),nr=[],li;" +
-                "for(li=0;li<L.length;li++)if(L[li].length)nr.push(L[li].split(','));" +
-                "if(rc>=0)offset=rc;" +
-                "if(!cols.length&&nr.length)build(nr[0]);" +
-                "for(var ri=1;ri<nr.length;ri++)rows.push(nr[ri]);" +
-                "if(rows.length>500)rows.splice(0,rows.length-500);" +
-                "console.log('poll: X-Row-Count='+rc+' neueZeilen='+(nr.length>0?nr.length-1:0)+' offset='+offset+' puffer='+rows.length);" +
-                "if(!rows.length){s.textContent='(warte auf Daten...)';return;}" +
-                "var d=rows.slice(-100),last=d[d.length-1],ci;" +
-                "for(ci=0;ci<cols.length;ci++){if(!rowEls[ci])continue;" +
-                "rowEls[ci].v.textContent=last[ci]!==undefined?last[ci]:'';" +
-                "var arr=[],di;for(di=0;di<d.length;di++){var f=parseFloat(d[di][ci]);arr.push(isNaN(f)?0:f);}" +
-                "rowEls[ci].b.innerHTML=svg(cols[ci],arr);}" +
-                "lu.textContent='Letzte Aktualisierung: '+new Date().toLocaleString();" +
-                "s.textContent='aktualisiert';" +
-                "}catch(e){s.textContent='(warte auf Daten...)';}" +
-                "finally{clearTimeout(tmo);inflight=false;}}" +
-                "var elT=[document.getElementById('tA'),document.getElementById('tB'),document.getElementById('tC')];" +
-                "var elS=[document.getElementById('sA'),document.getElementById('sB'),document.getElementById('sC')];" +
-                "var elSv=[document.getElementById('sAv'),document.getElementById('sBv'),document.getElementById('sCv')];" +
+                "if(rc>=0&&offset>=0&&rc<offset){console.log('reset: Neustart erkannt rc='+rc+' offset='+offset);rows.length=0;offset=-1;return;}",
+                "var t=await resp.text();",
+                "var L=t.replace(/\\r/g,'').split('\\n'),nr=[],li;",
+                "for(li=0;li<L.length;li++)if(L[li].length)nr.push(L[li].split(','));",
+                "if(rc>=0)offset=rc;",
+                "if(!cols.length&&nr.length)build(nr[0]);",
+                "for(var ri=1;ri<nr.length;ri++)rows.push(nr[ri]);",
+                "if(rows.length>500)rows.splice(0,rows.length-500);",
+                "console.log('poll: X-Row-Count='+rc+' neueZeilen='+(nr.length>0?nr.length-1:0)+' offset='+offset+' puffer='+rows.length);",
+                "if(!rows.length){s.textContent='(warte auf Daten...)';return;}",
+                "if(nodeIx>=0){renderN();}else{",
+                "var d=rows.slice(-100),last=d[d.length-1],ci;",
+                "for(ci=0;ci<cols.length;ci++){if(!rowEls[ci])continue;",
+                "rowEls[ci].v.textContent=last[ci]!==undefined?last[ci]:'';",
+                "var arr=[],di;for(di=0;di<d.length;di++){var f=parseFloat(d[di][ci]);arr.push(isNaN(f)?0:f);}",
+                "rowEls[ci].b.innerHTML=svg(cols[ci],arr);}}",
+                "lu.textContent='Letzte Aktualisierung: '+new Date().toLocaleString();",
+                "s.textContent='aktualisiert';",
+                "}catch(e){s.textContent='(warte auf Daten...)';}",
+                "finally{clearTimeout(tmo);inflight=false;}}",
+                "var elT=[document.getElementById('tA'),document.getElementById('tB'),document.getElementById('tC')];",
+                "var elS=[document.getElementById('sA'),document.getElementById('sB'),document.getElementById('sC')];",
+                "var elSv=[document.getElementById('sAv'),document.getElementById('sBv'),document.getElementById('sCv')];",
                 // Controls ride along on the next /data poll (no separate request,
                 // so no collision with polling). Flipping a control triggers an
                 // immediate tick() for snappy response; the inflight guard keeps
                 // it from overlapping the periodic poll.
-                "elT.forEach(function(e){e.addEventListener('change',tick);});" +
-                "elS.forEach(function(e,i){e.addEventListener('change',tick);e.addEventListener('input',function(){elSv[i].textContent=e.value;});});" +
-                "fetch('/controls',{cache:'no-store'}).then(function(r){return r.json();}).then(function(c){" +
-                "elT[0].checked=c.tA==1;elT[1].checked=c.tB==1;elT[2].checked=c.tC==1;" +
-                "elS[0].value=c.sA;elS[1].value=c.sB;elS[2].value=c.sC;" +
-                "elSv[0].textContent=c.sA;elSv[1].textContent=c.sB;elSv[2].textContent=c.sC;" +
-                "ctrlReady=true;});" +
-                "setInterval(tick,2000);tick();" +
-                "</script></body></html>"
+                "elT.forEach(function(e){e.addEventListener('change',tick);});",
+                "elS.forEach(function(e,i){e.addEventListener('change',tick);e.addEventListener('input',function(){elSv[i].textContent=e.value;});});",
+                "fetch('/controls',{cache:'no-store'}).then(function(r){return r.json();}).then(function(c){",
+                "elT[0].checked=c.tA==1;elT[1].checked=c.tB==1;elT[2].checked=c.tC==1;",
+                "elS[0].value=c.sA;elS[1].value=c.sB;elS[2].value=c.sC;",
+                "elSv[0].textContent=c.sA;elSv[1].textContent=c.sB;elSv[2].textContent=c.sC;",
+                "ctrlReady=true;});",
+                "setInterval(tick,2000);tick();",
+                "</script></body></html>",
+            ]
         }
-        return cachedPage
+    }
+
+    // Dispatch a request. The two BIG responses (the dashboard page and the full
+    // CSV log) are streamed so we never build the whole thing as one string --
+    // that single oversized allocation is what trips error 022
+    // (GC_TOO_BIG_ALLOCATION). All other responses are small and bounded, so they
+    // go through the simple build-then-send path unchanged.
+    function serveRequest(linkId: string, path: string) {
+        if (path.indexOf("/log.csv") == 0) {
+            serveLogCsv(linkId)
+        } else if (path.indexOf("/data") == 0 || path.indexOf("/controls") == 0
+            || path.indexOf("/push") == 0 || path.indexOf("/favicon") == 0) {
+            serveResponse(linkId, routeResponse(path))
+        } else {
+            servePage(linkId)
+        }
+    }
+
+    // Stream the dashboard HTML. The page is already cached as one string; we send
+    // its bytes in CHUNK pieces directly instead of concatenating headers+body
+    // into a second full-size copy (which doubled peak memory and caused 022).
+    function servePage(linkId: string) {
+        buildPage()
+        let len = 0
+        for (let i = 0; i < pageSegs.length; i++) len += pageSegs[i].length
+        let head = "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/html; charset=utf-8\r\n" +
+            "Content-Length: " + len + "\r\n" +
+            "Cache-Control: no-cache\r\n" +
+            "X-Log-Full: " + (logFull ? "1" : "0") + "\r\n" +
+            "Connection: keep-alive\r\n\r\n"
+        if (!sendChunk(linkId, head)) return
+        // Pack the small segments into <=CHUNK packets; never one big string.
+        let buf = ""
+        for (let i = 0; i < pageSegs.length; i++) {
+            if (buf.length + pageSegs[i].length > CHUNK && buf.length > 0) {
+                if (!sendChunk(linkId, buf)) return
+                buf = ""
+                basic.pause(20)
+            }
+            buf += pageSegs[i]
+        }
+        if (buf.length > 0) sendChunk(linkId, buf)
+    }
+
+    // Stream the full log as CSV without ever holding it all in one string.
+    // Two passes over the rows in small batches: pass 1 measures the exact body
+    // length (for Content-Length), pass 2 sends it batch by batch. Only the
+    // snapshot of rows [0, total) is read, so rows appended meanwhile are ignored
+    // and the length stays consistent.
+    function serveLogCsv(linkId: string) {
+        let total = datalogger.getNumberOfRows()   // includes the header row
+        let BATCH = 20
+        let bodyLen = 0
+        let i = 0
+        let first = true
+        while (i < total) {
+            let n = total - i
+            if (n > BATCH) n = BATCH
+            if (!first) bodyLen += 1                 // the "\n" that joins batches
+            bodyLen += datalogger.getRows(i, n).length
+            first = false
+            i += n
+        }
+        let head = "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/csv; charset=utf-8\r\n" +
+            "Content-Length: " + bodyLen + "\r\n" +
+            "Cache-Control: no-cache\r\n" +
+            "X-Log-Full: " + (logFull ? "1" : "0") + "\r\n" +
+            "Connection: keep-alive\r\n\r\n"
+        if (!sendChunk(linkId, head)) return
+        i = 0
+        first = true
+        while (i < total) {
+            let n = total - i
+            if (n > BATCH) n = BATCH
+            let piece = (first ? "" : "\n") + datalogger.getRows(i, n)
+            if (!sendChunk(linkId, piece)) return
+            first = false
+            i += n
+            basic.pause(20)
+        }
+    }
+
+    // Send a small header string, then a (possibly large) body in CHUNK pieces,
+    // WITHOUT concatenating them into one big string first.
+    function serveHeadAndBody(linkId: string, head: string, body: string) {
+        if (!sendChunk(linkId, head)) return
+        let i = 0
+        while (i < body.length) {
+            if (!sendChunk(linkId, body.substr(i, CHUNK))) return
+            i += CHUNK
+            basic.pause(20)
+        }
     }
 
     // Send the response in <=CHUNK pieces on the given link id. No CIPCLOSE.

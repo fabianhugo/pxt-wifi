@@ -5,7 +5,7 @@
  * 
  * with datalogger.log(...), and the WiFi dashboard reads them back (getRows)
  * 
- * and serves them at http://1.1.1.1. Join the WiFi "CalliopeHub" (open).
+ * and serves them at http://4.3.2.1. Join the WiFi "CalliopeHub" (open).
  * 
  * The driver lives in wifi.ts (namespace WiFi).
  */
@@ -25,7 +25,12 @@ input.onButtonEvent(Button.AB, input.buttonEventClick(), function () {
 // Heartbeat: confirms the program is actually running (rules out a startup fault).
 basic.showIcon(IconNames.Heart)
 basic.pause(500)
+// Start each boot with a clean log so the "node" schema below always takes
+// effect. The datalogger lives in flash and SURVIVES reflashing -- without this
+// an older schema (no "node" column) would stick and node data wouldn't group.
+datalogger.deleteLog()
 datalogger.setColumnTitles(
+"node",
 "temp",
 "light",
 "sound"
@@ -72,6 +77,7 @@ loops.everyInterval(2000, function () {
         led.unplot(3, 2)
     }
     datalogger.log(
+    datalogger.createCV("node", "hub"),
     datalogger.createCV("temp", input.temperature()),
     datalogger.createCV("light", input.lightLevel()),
     datalogger.createCV("sound", input.soundLevel())
