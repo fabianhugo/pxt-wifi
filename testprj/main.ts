@@ -25,12 +25,7 @@ input.onButtonEvent(Button.AB, input.buttonEventClick(), function () {
 // Heartbeat: confirms the program is actually running (rules out a startup fault).
 basic.showIcon(IconNames.Heart)
 basic.pause(500)
-// Start each boot with a clean log so the "node" schema below always takes
-// effect. The datalogger lives in flash and SURVIVES reflashing -- without this
-// an older schema (no "node" column) would stick and node data wouldn't group.
-datalogger.deleteLog()
 datalogger.setColumnTitles(
-"node",
 "temp",
 "light",
 "sound"
@@ -77,7 +72,6 @@ loops.everyInterval(2000, function () {
         led.unplot(3, 2)
     }
     datalogger.log(
-    datalogger.createCV("node", "hub"),
     datalogger.createCV("temp", input.temperature()),
     datalogger.createCV("light", input.lightLevel()),
     datalogger.createCV("sound", input.soundLevel())
