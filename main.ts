@@ -144,22 +144,18 @@ namespace WiFi {
     let netTimeOk = false                 // did the last fetch succeed?
     let netLastTry = 0                    // runningTime() of the last attempt
     let netBusy = false                   // a fetch is in progress (see below)
-    // Diagnostics for the blocks below: how far the last fetch got, and the raw
-    // text the module sent back. Shown by "last time error" / "last time reply".
-    // 0 = ok, 1 = connect failed, 2 = no send prompt, 3 = sent but no Date header.
-    let netStage = 0
-    let netRaw = ""
 
     /**
-     * True if the internet could be reached (the time was fetched successfully).
-     * Needs station mode -- use "Setup Wifi", not the access point.
+     * True if the internet can be reached: pings a website and waits for a reply.
+     * Independent of the internet time blocks. Needs station mode ("Setup Wifi").
      */
     //% block="Internet OK?"
     //% group="UartWiFi"
     //% weight=80
     export function internetOk(): boolean {
-        refreshNetTime()
-        return netTimeOk
+        clearSerialBuffer()
+        sendAtCmd("AT+PING=\"" + TIME_HOST + "\"")
+        return waitAtResponse("+PING:", "ERROR", "timeout", 5000) == 1
     }
 
     /**
@@ -189,59 +185,27 @@ namespace WiFi {
         return civilFromUnix(t, unit)
     }
 
-    /**
-     * How far the last internet-time fetch got, for diagnosing a failure:
-     * 0 = ok, 1 = could not connect, 2 = module gave no send prompt,
-     * 3 = request sent but no date found in the reply.
-     */
-    //% block="last time error"
-    //% group="UartWiFi"
-    //% weight=76
-    //% advanced=true
-    export function lastTimeError(): number {
-        return netStage
-    }
-
-    /**
-     * The raw text the module returned during the last internet-time fetch
-     * (newlines flattened to spaces). Show it with "show string" to see what the
-     * module actually said.
-     */
-    //% block="last time reply"
-    //% group="UartWiFi"
-    //% weight=75
-    //% advanced=true
-    export function lastTimeReply(): string {
-        let out = ""
-        for (let i = 0; i < netRaw.length; i++) {
-            let c = netRaw.charAt(i)
-            if (c == "\r" || c == "\n") out += " "
-            else out += c
-        }
-        return out
-    }
-
     // Fetch only when we have nothing, or the cached time is stale. Everything
     // else is served from the cache, so putting these blocks in a 1 s loop costs
     // nothing.
     function refreshNetTime() {
-        // Re-entry guard: these blocks are value blocks a user will drop into a
-        // fast forever/everyInterval loop. Without this, a second fiber could
-        // start issuing AT commands while the first is mid-conversation and
-        // corrupt both replies.
+        // Re-entry guard: fetchNetDate() yields (basic.pause), so a second fiber
+        // could otherwise start issuing AT commands mid-conversation and corrupt
+        // both replies.
         if (netBusy) return
         let now = input.runningTime()
-        if (netTimeOk && (now - netDeviceMs) < TIME_REFRESH_MS) return
-        if (netLastTry != 0 && (now - netLastTry) < TIME_RETRY_MS) return
+        // Fresh enough, or we failed very recently -- a failed fetch takes several
+        // seconds, so without the backoff a loop with no internet would retry
+        // nonstop.
+        let wait = netTimeOk ? TIME_REFRESH_MS : TIME_RETRY_MS
+        if (netLastTry != 0 && (now - netLastTry) < wait) return
         netLastTry = now
         netBusy = true
         let epoch = fetchNetDate()
-        if (epoch > 0) {
+        netTimeOk = epoch > 0
+        if (netTimeOk) {
             netEpochSec = epoch
             netDeviceMs = input.runningTime()
-            netTimeOk = true
-        } else {
-            netTimeOk = false
         }
         netBusy = false
     }
@@ -270,8 +234,7 @@ namespace WiFi {
 
         sendAtCmd("AT+CIPSTART=\"TCP\",\"" + TIME_HOST + "\",80")
         if (waitAtResponse("OK", "ALREADY CONNECTED", "ERROR", 5000) == 3) {
-            netStage = 1                      // could not connect
-            return 0
+            return 0                          // could not connect
         }
 
         let req =
@@ -281,7 +244,6 @@ namespace WiFi {
 
         sendAtCmd("AT+CIPSEND=" + req.length)
         if (waitAtResponse(">", "OK", "ERROR", 2000) == 3) {
-            netStage = 2                      // no send prompt
             sendAtCmd("AT+CIPCLOSE")
             waitAtResponse("OK", "ERROR", "None", 1000)
             return 0
@@ -318,9 +280,6 @@ namespace WiFi {
                 if (buf.length > 100 && (input.runningTime() - lastData) > 2000) break
             }
         }
-
-        netRaw = buf                          // keep the raw reply for diagnosis
-        netStage = epoch > 0 ? 0 : 3          // 3 = sent, but no usable Date header
 
         sendAtCmd("AT+CIPCLOSE")
         waitAtResponse("OK", "ERROR", "None", 1000)
