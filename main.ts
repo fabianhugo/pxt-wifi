@@ -31,7 +31,7 @@ enum TimeUnit {
  * Functions to operate Grove module.
  */
 //% weight=10 color=#9F79EE icon="\uf1b3" block="WiFi"
-//% groups='["UartWiFi", "Access Point", "Web Controls"]'
+//% groups='["UartWiFi", "Access Point"]'
 namespace WiFi {
     /**
      * 
@@ -39,10 +39,6 @@ namespace WiFi {
 
     let isWifiConnected = false;
     let wifiBaudRate = BaudRate.BaudRate115200;
-    // Default target for the "internet ok" check. Small, stable, reserved for
-    // exactly this kind of use, and not blocked in as many networks as the
-    // public DNS resolvers.
-    const PING_HOST = "example.com"
     /**
      * Setup Grove - Uart WiFi V2 to connect to  Wi-Fi
      */
@@ -123,85 +119,53 @@ namespace WiFi {
         return isWifiConnected
     }
 
+    // =====================================================================
+    // Internet clock
+    //
+    // One network operation for everything: fetch the "Date:" header from a
+    // website. Every HTTP server sends it in the fixed RFC 7231 format
+    // ("Date: Wed, 19 Aug 2026 15:43:39 GMT"), so no JSON, no API key, no TLS.
+    //
+    // The result is cached: the fetch happens at most every TIME_REFRESH_MS, and
+    // in between the clock is advanced from input.runningTime(). "Internet OK?"
+    // just reports whether the last fetch worked, so the blocks can be called in
+    // a fast loop without hitting the network every time.
+    // =====================================================================
+
+    // Mozilla's captive-portal endpoint: meant for exactly this kind of
+    // unauthenticated probe, plain HTTP, and an 8-byte body.
+    const TIME_HOST = "detectportal.firefox.com"
+    const TIME_PATH = "/success.txt"
+    const TIME_REFRESH_MS = 600000        // re-fetch at most every 10 minutes
+    const TIME_RETRY_MS = 15000           // ...but after a failure, retry sooner
+
+    let netEpochSec = 0                   // Unix seconds at the moment of the fetch
+    let netDeviceMs = 0                   // runningTime() at that same moment
+    let netTimeOk = false                 // did the last fetch succeed?
+    let netLastTry = 0                    // runningTime() of the last attempt
+    let netBusy = false                   // a fetch is in progress (see below)
+    // Diagnostics for the blocks below: how far the last fetch got, and the raw
+    // text the module sent back. Shown by "last time error" / "last time reply".
+    // 0 = ok, 1 = connect failed, 2 = no send prompt, 3 = sent but no Date header.
+    let netStage = 0
+    let netRaw = ""
+
     /**
-     * Check that the internet is actually reachable (not just the WiFi link).
-     * Pings a well-known host; falls back to opening a TCP connection to it if
-     * the module's firmware has no AT+PING. Needs station mode ("Setup Wifi").
+     * True if the internet could be reached (the time was fetched successfully).
+     * Needs station mode -- use "Setup Wifi", not the access point.
      */
     //% block="Internet OK?"
     //% group="UartWiFi"
     //% weight=80
     export function internetOk(): boolean {
-        return internetOkHost(PING_HOST)
+        refreshNetTime()
+        return netTimeOk
     }
-
-    /**
-     * Like "internet ok" but you choose the host to test against.
-     */
-    //% block="internet ok via %host"
-    //% host.defl="example.com"
-    //% group="UartWiFi"
-    //% advanced=true
-    export function internetOkHost(host: string): boolean {
-        // A WiFi join can succeed while the uplink is dead (captive portal, no
-        // DHCP route, ISP down), so isWifiConnected alone proves nothing. But if
-        // we never joined, there is nothing to test.
-        if (!isWifiConnected) return false
-
-        // Client requests use single-connection mode. A program that ran the AP
-        // server left CIPMUX=1, which would reject the commands below; close any
-        // stale socket first (the module keeps TCP state across Calliope resets).
-        sendAtCmd("AT+CIPCLOSE")
-        waitAtResponse("OK", "ERROR", "CLOSED", 1000)
-        sendAtCmd("AT+CIPMUX=0")
-        waitAtResponse("OK", "ERROR", "None", 1000)
-
-        // Preferred: a real ICMP ping. Answers "+PING:<ms>" then OK on success,
-        // and "+timeout"/ERROR when the host is unreachable.
-        sendAtCmd("AT+PING=\"" + host + "\"")
-        let r = waitAtResponse("+PING:", "ERROR", "timeout", 6000)
-        if (r == 1) return true
-
-        // ERROR here is ambiguous: unreachable host, OR firmware without AT+PING.
-        // Distinguish by trying a TCP connect to port 80 -- reaching the handshake
-        // proves DNS and routing work, which is what "internet ok" really means.
-        sendAtCmd("AT+CIPSTART=\"TCP\",\"" + host + "\",80")
-        r = waitAtResponse("OK", "ALREADY CONNECTED", "ERROR", 6000)
-        let reachable = (r == 1 || r == 2)
-        sendAtCmd("AT+CIPCLOSE")               // never leave the socket open
-        waitAtResponse("OK", "ERROR", "CLOSED", 1000)
-        return reachable
-    }
-
-    // ---------------------------------------------------------------------
-    // Internet clock
-    //
-    // Every HTTP server stamps its replies with a "Date:" header in the fixed
-    // RFC 7231 format ("Date: Wed, 19 Aug 2026 15:43:39 GMT"), so we can read the
-    // wall clock off any well-known website with no JSON parsing and no API key.
-    // We ask for a 204 (empty body) URL so the reply is only headers.
-    //
-    // The fetched time is cached and kept running by input.runningTime(), so
-    // repeated block calls do NOT hit the network every time.
-    // ---------------------------------------------------------------------
-
-    const TIME_HOST = "www.google.com"
-    const TIME_PATH = "/generate_204"
-    // Re-fetch at most this often (ms). Between fetches the clock is advanced
-    // locally, which is plenty accurate for logging.
-    const TIME_REFRESH_MS = 600000        // 10 minutes
-
-    let netEpochSec = 0                   // Unix seconds at the moment of the fetch
-    let netDeviceMs = 0                   // input.runningTime() at that same moment
-    let netTimeOk = false                 // have we ever successfully fetched?
-    let netLastTry = 0                    // runningTime() of the last attempt
 
     /**
      * Current time from the internet as a Unix timestamp (seconds since
-     * 1 Jan 1970, UTC). Fetches from a website the first time it is used, then
-     * keeps the clock running locally (re-checks every ~10 minutes).
-     * Returns 0 if the time could not be fetched. Needs station mode
-     * ("Setup Wifi") and a working internet connection.
+     * 1 Jan 1970, UTC). Returns 0 if it could not be fetched.
+     * Needs station mode ("Setup Wifi").
      */
     //% block="internet time (Unix s)"
     //% group="UartWiFi"
@@ -214,8 +178,7 @@ namespace WiFi {
 
     /**
      * One part (year, month, day, hour, minute or second) of the current time
-     * fetched from the internet. Time is UTC. Returns 0 if the time could not
-     * be fetched.
+     * from the internet, in UTC. Returns 0 if it could not be fetched.
      */
     //% block="internet time %unit"
     //% group="UartWiFi"
@@ -226,70 +189,165 @@ namespace WiFi {
         return civilFromUnix(t, unit)
     }
 
-    // Fetch the time only if we have never got it, or the cache is stale.
-    function refreshNetTime() {
-        let now = input.runningTime()
-        // Don't hammer the network when a fetch keeps failing: retry no more than
-        // every 10 s until the first success.
-        if (netTimeOk && (now - netDeviceMs) < TIME_REFRESH_MS) return
-        if (netLastTry != 0 && (now - netLastTry) < 10000) return
-        netLastTry = now
-        fetchNetTime()
+    /**
+     * How far the last internet-time fetch got, for diagnosing a failure:
+     * 0 = ok, 1 = could not connect, 2 = module gave no send prompt,
+     * 3 = request sent but no date found in the reply.
+     */
+    //% block="last time error"
+    //% group="UartWiFi"
+    //% weight=76
+    //% advanced=true
+    export function lastTimeError(): number {
+        return netStage
     }
 
-    // Open a TCP connection, send a bare HTTP request and read the "Date:" header
-    // out of the reply. Always closes its own socket.
-    function fetchNetTime() {
-        if (!isWifiConnected) return
-
-        sendAtCmd("AT+CIPCLOSE")
-        waitAtResponse("OK", "ERROR", "CLOSED", 1000)
-        sendAtCmd("AT+CIPMUX=0")
-        waitAtResponse("OK", "ERROR", "None", 1000)
-
-        sendAtCmd("AT+CIPSTART=\"TCP\",\"" + TIME_HOST + "\",80")
-        let r = waitAtResponse("OK", "ALREADY CONNECTED", "ERROR", 6000)
-        if (r != 1 && r != 2) return
-
-        let req = "GET " + TIME_PATH + " HTTP/1.1\r\nHost: " + TIME_HOST + "\r\nConnection: close\r\n\r\n"
-        sendAtCmd("AT+CIPSEND=" + req.length)
-        r = waitAtResponse(">", "ERROR", "busy", 3000)
-        if (r != 1) {
-            sendAtCmd("AT+CIPCLOSE")
-            waitAtResponse("OK", "ERROR", "CLOSED", 1000)
-            return
+    /**
+     * The raw text the module returned during the last internet-time fetch
+     * (newlines flattened to spaces). Show it with "show string" to see what the
+     * module actually said.
+     */
+    //% block="last time reply"
+    //% group="UartWiFi"
+    //% weight=75
+    //% advanced=true
+    export function lastTimeReply(): string {
+        let out = ""
+        for (let i = 0; i < netRaw.length; i++) {
+            let c = netRaw.charAt(i)
+            if (c == "\r" || c == "\n") out += " "
+            else out += c
         }
-        serial.writeString(req)
+        return out
+    }
 
-        // Collect the reply until we have the Date header (or give up).
-        let buf = ""
-        let start = input.runningTime()
-        let epoch = 0
-        while ((input.runningTime() - start) < 6000) {
-            buf += serial.readString()
-            let d = parseHttpDate(buf)
-            if (d > 0) { epoch = d; break }
-            basic.pause(100)
-        }
-
-        sendAtCmd("AT+CIPCLOSE")
-        waitAtResponse("OK", "ERROR", "CLOSED", 1000)
-
+    // Fetch only when we have nothing, or the cached time is stale. Everything
+    // else is served from the cache, so putting these blocks in a 1 s loop costs
+    // nothing.
+    function refreshNetTime() {
+        // Re-entry guard: these blocks are value blocks a user will drop into a
+        // fast forever/everyInterval loop. Without this, a second fiber could
+        // start issuing AT commands while the first is mid-conversation and
+        // corrupt both replies.
+        if (netBusy) return
+        let now = input.runningTime()
+        if (netTimeOk && (now - netDeviceMs) < TIME_REFRESH_MS) return
+        if (netLastTry != 0 && (now - netLastTry) < TIME_RETRY_MS) return
+        netLastTry = now
+        netBusy = true
+        let epoch = fetchNetDate()
         if (epoch > 0) {
             netEpochSec = epoch
             netDeviceMs = input.runningTime()
             netTimeOk = true
+        } else {
+            netTimeOk = false
+        }
+        netBusy = false
+    }
+
+    // Open a TCP connection, send a bare HTTP request, read the "Date:" header out
+    // of the reply. Returns Unix seconds, or 0 on any failure.
+    //
+    // This deliberately mirrors adafruitIOGetValue(), which is the one function in
+    // this driver that already reads a reply BODY successfully. The details that
+    // matter (all learned from it):
+    //   * clearSerialBuffer() first, so stale bytes can't corrupt the parse.
+    //   * serial.writeString(req + "\r\n") with AT+CIPSEND=req.length -- NOT
+    //     sendAtCmd(req), and no "+ 2" on the length.
+    //   * a TIGHT read loop that only pauses after many empty reads. Pausing 50 ms
+    //     every iteration (an earlier version of this code) is slow enough to miss
+    //     the reply.
+    //   * don't touch CIPMUX. The AP server needs CIPMUX=1 and adafruitIOGetValue
+    //     works without changing it.
+    // The reply is "+IPD,<len>:<data>" framed, but we don't parse that -- we just
+    // scan the raw stream for the Date header.
+    function fetchNetDate(): number {
+        clearSerialBuffer()
+
+        sendAtCmd("AT+CIPCLOSE")
+        waitAtResponse("OK", "ERROR", "None", 1000)
+
+        sendAtCmd("AT+CIPSTART=\"TCP\",\"" + TIME_HOST + "\",80")
+        if (waitAtResponse("OK", "ALREADY CONNECTED", "ERROR", 5000) == 3) {
+            netStage = 1                      // could not connect
+            return 0
+        }
+
+        let req =
+            "GET " + TIME_PATH + " HTTP/1.1\r\n" +
+            "Host: " + TIME_HOST + "\r\n" +
+            "Connection: close\r\n\r\n"
+
+        sendAtCmd("AT+CIPSEND=" + req.length)
+        if (waitAtResponse(">", "OK", "ERROR", 2000) == 3) {
+            netStage = 2                      // no send prompt
+            sendAtCmd("AT+CIPCLOSE")
+            waitAtResponse("OK", "ERROR", "None", 1000)
+            return 0
+        }
+
+        serial.writeString(req + "\r\n")
+
+        // Read incrementally and keep EVERYTHING: the module can deliver
+        // "SEND OK", the "+IPD," framing and the headers in one read, so a
+        // waitAtResponse() call here would throw the Date header away.
+        let buf = ""
+        let epoch = 0
+        let start = input.runningTime()
+        let lastData = start
+        let emptyReads = 0
+
+        while ((input.runningTime() - start) < 10000) {
+            let chunk = serial.readString()
+            if (chunk.length > 0) {
+                buf += chunk
+                lastData = input.runningTime()
+                emptyReads = 0
+                if (epoch == 0) epoch = parseHttpDate(buf)
+                if (chunk.includes("CLOSED")) break
+            } else {
+                emptyReads++
+                if (emptyReads > 150) {
+                    basic.pause(5)
+                    emptyReads = 0
+                }
+                // Got the date and the stream went quiet -- done.
+                if (epoch > 0 && (input.runningTime() - lastData) > 500) break
+                // Nothing new for 2 s -- give up on more data.
+                if (buf.length > 100 && (input.runningTime() - lastData) > 2000) break
+            }
+        }
+
+        netRaw = buf                          // keep the raw reply for diagnosis
+        netStage = epoch > 0 ? 0 : 3          // 3 = sent, but no usable Date header
+
+        sendAtCmd("AT+CIPCLOSE")
+        waitAtResponse("OK", "ERROR", "None", 1000)
+        return epoch
+    }
+
+    // Index just past a line-initial "Date: " header, or -1. Anchored to a line
+    // start so headers like "X-Origin-Date:" can't be mistaken for the real one.
+    function findDateHeader(resp: string): number {
+        let from = 0
+        while (true) {
+            let i = resp.indexOf("Date: ", from)
+            if (i < 0) {
+                i = resp.indexOf("date: ", from)
+                if (i < 0) return -1
+            }
+            if (i == 0 || resp.charAt(i - 1) == "\n") return i + 6
+            from = i + 6
         }
     }
 
-    // Pull "Date: Wed, 19 Aug 2026 15:43:39 GMT" out of an HTTP reply and convert
-    // it to Unix seconds. Returns 0 if the header isn't there (yet) or is short.
+    // "Wed, 19 Aug 2026 15:43:39 GMT" -> Unix seconds. 0 if absent/incomplete.
     function parseHttpDate(resp: string): number {
-        let i = resp.indexOf("Date: ")
-        if (i < 0) i = resp.indexOf("date: ")
+        let i = findDateHeader(resp)          // already points past "Date: "
         if (i < 0) return 0
-        let s = resp.substr(i + 6, 26)        // "Wed, 19 Aug 2026 15:43:39 "
-        if (s.length < 25) return 0           // header not fully arrived yet
+        let s = resp.substr(i, 26)            // "Wed, 19 Aug 2026 15:43:39 "
+        if (s.length < 25) return 0           // header hasn't fully arrived yet
         // Fixed offsets after the 5-char weekday prefix ("Wed, ").
         let day = parseInt(s.substr(5, 2))
         let mon = monthFromName(s.substr(8, 3))
@@ -297,8 +355,8 @@ namespace WiFi {
         let hour = parseInt(s.substr(17, 2))
         let min = parseInt(s.substr(20, 2))
         let sec = parseInt(s.substr(23, 2))
-        // Sanity-check the parse rather than trusting fixed offsets blindly: a
-        // mangled or partial header must yield 0, never a bogus time.
+        // Validate rather than trust the offsets: a mangled or partially received
+        // header must yield 0, never a bogus time.
         if (mon == 0 || isNaN(day) || isNaN(year) || isNaN(hour) || isNaN(min) || isNaN(sec)) return 0
         if (year < 1970 || day < 1 || day > 31) return 0
         if (hour > 23 || min > 59 || sec > 60) return 0
@@ -331,16 +389,12 @@ namespace WiFi {
         return 31
     }
 
-    // Days since 1 Jan 1970 for a civil date (year >= 1970).
-    function daysFromCivil(year: number, mon: number, day: number): number {
+    function unixFromCivil(year: number, mon: number, day: number, hour: number, min: number, sec: number): number {
         let days = 0
         for (let y = 1970; y < year; y++) days += isLeap(y) ? 366 : 365
         for (let m = 1; m < mon; m++) days += daysInMonth(year, m)
-        return days + day - 1
-    }
-
-    function unixFromCivil(year: number, mon: number, day: number, hour: number, min: number, sec: number): number {
-        return daysFromCivil(year, mon, day) * 86400 + hour * 3600 + min * 60 + sec
+        days += day - 1
+        return days * 86400 + hour * 3600 + min * 60 + sec
     }
 
     // Split Unix seconds back into the requested calendar field (UTC).
@@ -755,6 +809,7 @@ namespace WiFi {
     //% rxPin.defl=SerialPin.C16
     //% baudRate.defl=BaudRate.BaudRate115200
     //% ssid.defl="CalliopeHub"
+    //% weight=80
     export function startAccessPoint(txPin: SerialPin, rxPin: SerialPin, baudRate: BaudRate, ssid: string, passwd: string) {
         // Remember the config so the background loop can re-run setup after a
         // module reboot (config isn't persisted -- AT+SYSSTORE=0).
@@ -890,6 +945,7 @@ namespace WiFi {
      */
     //% block="Stop Access Point"
     //% group="Access Point"
+    //% weight=10
     export function stopAccessPoint() {
         // Stop the background loop and wait until it has actually exited, so we
         // don't drive the serial port from two fibers at once.
@@ -909,6 +965,7 @@ namespace WiFi {
      */
     //% block="Access Point ready?"
     //% group="Access Point"
+    //% weight=70
     export function accessPointOK(): boolean {
         return apReady
     }
@@ -918,6 +975,7 @@ namespace WiFi {
      */
     //% block="web toggle %which"
     //% group="Access Point"
+    //% weight=60
     export function toggle(which: WebControl): boolean {
         return ctrlToggle[which]
     }
@@ -927,6 +985,7 @@ namespace WiFi {
      */
     //% block="web slider %which"
     //% group="Access Point"
+    //% weight=50
     export function slider(which: WebControl): number {
         return ctrlSlider[which]
     }
@@ -939,6 +998,7 @@ namespace WiFi {
      */
     //% block="WiFi timestamp (Unix s)"
     //% group="Access Point"
+    //% weight=40
     export function timestamp(): number {
         if (!timeSynced) return 0
         return syncedEpochSec + Math.floor((input.runningTime() - syncedDeviceMs) / 1000)
