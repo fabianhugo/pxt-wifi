@@ -12,6 +12,21 @@ enum WebControl {
     //% block="C"
     C = 2
 }
+// Which part of the fetched wall-clock time "internet time" should return.
+enum TimeUnit {
+    //% block="year"
+    Year = 0,
+    //% block="month"
+    Month = 1,
+    //% block="day"
+    Day = 2,
+    //% block="hour"
+    Hour = 3,
+    //% block="minute"
+    Minute = 4,
+    //% block="second"
+    Second = 5
+}
 /**
  * Functions to operate Grove module.
  */
@@ -24,6 +39,10 @@ namespace WiFi {
 
     let isWifiConnected = false;
     let wifiBaudRate = BaudRate.BaudRate115200;
+    // Default target for the "internet ok" check. Small, stable, reserved for
+    // exactly this kind of use, and not blocked in as many networks as the
+    // public DNS resolvers.
+    const PING_HOST = "example.com"
     /**
      * Setup Grove - Uart WiFi V2 to connect to  Wi-Fi
      */
@@ -32,6 +51,7 @@ namespace WiFi {
     //% txPin.defl=SerialPin.C17
     //% rxPin.defl=SerialPin.C16
     //% baudRate.defl=BaudRate.BaudRate9600
+    //% weight=90
     export function setupWifi(txPin: SerialPin, rxPin: SerialPin, baudRate: BaudRate, ssid: string, passwd: string) {
         let result = 0
 
@@ -98,8 +118,255 @@ namespace WiFi {
      */
     //% block="Wifi OK?"
     //% group="UartWiFi"
+    //% weight=85
     export function wifiOK() {
         return isWifiConnected
+    }
+
+    /**
+     * Check that the internet is actually reachable (not just the WiFi link).
+     * Pings a well-known host; falls back to opening a TCP connection to it if
+     * the module's firmware has no AT+PING. Needs station mode ("Setup Wifi").
+     */
+    //% block="Internet OK?"
+    //% group="UartWiFi"
+    //% weight=80
+    export function internetOk(): boolean {
+        return internetOkHost(PING_HOST)
+    }
+
+    /**
+     * Like "internet ok" but you choose the host to test against.
+     */
+    //% block="internet ok via %host"
+    //% host.defl="example.com"
+    //% group="UartWiFi"
+    //% advanced=true
+    export function internetOkHost(host: string): boolean {
+        // A WiFi join can succeed while the uplink is dead (captive portal, no
+        // DHCP route, ISP down), so isWifiConnected alone proves nothing. But if
+        // we never joined, there is nothing to test.
+        if (!isWifiConnected) return false
+
+        // Client requests use single-connection mode. A program that ran the AP
+        // server left CIPMUX=1, which would reject the commands below; close any
+        // stale socket first (the module keeps TCP state across Calliope resets).
+        sendAtCmd("AT+CIPCLOSE")
+        waitAtResponse("OK", "ERROR", "CLOSED", 1000)
+        sendAtCmd("AT+CIPMUX=0")
+        waitAtResponse("OK", "ERROR", "None", 1000)
+
+        // Preferred: a real ICMP ping. Answers "+PING:<ms>" then OK on success,
+        // and "+timeout"/ERROR when the host is unreachable.
+        sendAtCmd("AT+PING=\"" + host + "\"")
+        let r = waitAtResponse("+PING:", "ERROR", "timeout", 6000)
+        if (r == 1) return true
+
+        // ERROR here is ambiguous: unreachable host, OR firmware without AT+PING.
+        // Distinguish by trying a TCP connect to port 80 -- reaching the handshake
+        // proves DNS and routing work, which is what "internet ok" really means.
+        sendAtCmd("AT+CIPSTART=\"TCP\",\"" + host + "\",80")
+        r = waitAtResponse("OK", "ALREADY CONNECTED", "ERROR", 6000)
+        let reachable = (r == 1 || r == 2)
+        sendAtCmd("AT+CIPCLOSE")               // never leave the socket open
+        waitAtResponse("OK", "ERROR", "CLOSED", 1000)
+        return reachable
+    }
+
+    // ---------------------------------------------------------------------
+    // Internet clock
+    //
+    // Every HTTP server stamps its replies with a "Date:" header in the fixed
+    // RFC 7231 format ("Date: Wed, 19 Aug 2026 15:43:39 GMT"), so we can read the
+    // wall clock off any well-known website with no JSON parsing and no API key.
+    // We ask for a 204 (empty body) URL so the reply is only headers.
+    //
+    // The fetched time is cached and kept running by input.runningTime(), so
+    // repeated block calls do NOT hit the network every time.
+    // ---------------------------------------------------------------------
+
+    const TIME_HOST = "www.google.com"
+    const TIME_PATH = "/generate_204"
+    // Re-fetch at most this often (ms). Between fetches the clock is advanced
+    // locally, which is plenty accurate for logging.
+    const TIME_REFRESH_MS = 600000        // 10 minutes
+
+    let netEpochSec = 0                   // Unix seconds at the moment of the fetch
+    let netDeviceMs = 0                   // input.runningTime() at that same moment
+    let netTimeOk = false                 // have we ever successfully fetched?
+    let netLastTry = 0                    // runningTime() of the last attempt
+
+    /**
+     * Current time from the internet as a Unix timestamp (seconds since
+     * 1 Jan 1970, UTC). Fetches from a website the first time it is used, then
+     * keeps the clock running locally (re-checks every ~10 minutes).
+     * Returns 0 if the time could not be fetched. Needs station mode
+     * ("Setup Wifi") and a working internet connection.
+     */
+    //% block="internet time (Unix s)"
+    //% group="UartWiFi"
+    //% weight=78
+    export function internetTimestamp(): number {
+        refreshNetTime()
+        if (!netTimeOk) return 0
+        return netEpochSec + Math.floor((input.runningTime() - netDeviceMs) / 1000)
+    }
+
+    /**
+     * One part (year, month, day, hour, minute or second) of the current time
+     * fetched from the internet. Time is UTC. Returns 0 if the time could not
+     * be fetched.
+     */
+    //% block="internet time %unit"
+    //% group="UartWiFi"
+    //% weight=77
+    export function internetTime(unit: TimeUnit): number {
+        let t = internetTimestamp()
+        if (t == 0) return 0
+        return civilFromUnix(t, unit)
+    }
+
+    // Fetch the time only if we have never got it, or the cache is stale.
+    function refreshNetTime() {
+        let now = input.runningTime()
+        // Don't hammer the network when a fetch keeps failing: retry no more than
+        // every 10 s until the first success.
+        if (netTimeOk && (now - netDeviceMs) < TIME_REFRESH_MS) return
+        if (netLastTry != 0 && (now - netLastTry) < 10000) return
+        netLastTry = now
+        fetchNetTime()
+    }
+
+    // Open a TCP connection, send a bare HTTP request and read the "Date:" header
+    // out of the reply. Always closes its own socket.
+    function fetchNetTime() {
+        if (!isWifiConnected) return
+
+        sendAtCmd("AT+CIPCLOSE")
+        waitAtResponse("OK", "ERROR", "CLOSED", 1000)
+        sendAtCmd("AT+CIPMUX=0")
+        waitAtResponse("OK", "ERROR", "None", 1000)
+
+        sendAtCmd("AT+CIPSTART=\"TCP\",\"" + TIME_HOST + "\",80")
+        let r = waitAtResponse("OK", "ALREADY CONNECTED", "ERROR", 6000)
+        if (r != 1 && r != 2) return
+
+        let req = "GET " + TIME_PATH + " HTTP/1.1\r\nHost: " + TIME_HOST + "\r\nConnection: close\r\n\r\n"
+        sendAtCmd("AT+CIPSEND=" + req.length)
+        r = waitAtResponse(">", "ERROR", "busy", 3000)
+        if (r != 1) {
+            sendAtCmd("AT+CIPCLOSE")
+            waitAtResponse("OK", "ERROR", "CLOSED", 1000)
+            return
+        }
+        serial.writeString(req)
+
+        // Collect the reply until we have the Date header (or give up).
+        let buf = ""
+        let start = input.runningTime()
+        let epoch = 0
+        while ((input.runningTime() - start) < 6000) {
+            buf += serial.readString()
+            let d = parseHttpDate(buf)
+            if (d > 0) { epoch = d; break }
+            basic.pause(100)
+        }
+
+        sendAtCmd("AT+CIPCLOSE")
+        waitAtResponse("OK", "ERROR", "CLOSED", 1000)
+
+        if (epoch > 0) {
+            netEpochSec = epoch
+            netDeviceMs = input.runningTime()
+            netTimeOk = true
+        }
+    }
+
+    // Pull "Date: Wed, 19 Aug 2026 15:43:39 GMT" out of an HTTP reply and convert
+    // it to Unix seconds. Returns 0 if the header isn't there (yet) or is short.
+    function parseHttpDate(resp: string): number {
+        let i = resp.indexOf("Date: ")
+        if (i < 0) i = resp.indexOf("date: ")
+        if (i < 0) return 0
+        let s = resp.substr(i + 6, 26)        // "Wed, 19 Aug 2026 15:43:39 "
+        if (s.length < 25) return 0           // header not fully arrived yet
+        // Fixed offsets after the 5-char weekday prefix ("Wed, ").
+        let day = parseInt(s.substr(5, 2))
+        let mon = monthFromName(s.substr(8, 3))
+        let year = parseInt(s.substr(12, 4))
+        let hour = parseInt(s.substr(17, 2))
+        let min = parseInt(s.substr(20, 2))
+        let sec = parseInt(s.substr(23, 2))
+        // Sanity-check the parse rather than trusting fixed offsets blindly: a
+        // mangled or partial header must yield 0, never a bogus time.
+        if (mon == 0 || isNaN(day) || isNaN(year) || isNaN(hour) || isNaN(min) || isNaN(sec)) return 0
+        if (year < 1970 || day < 1 || day > 31) return 0
+        if (hour > 23 || min > 59 || sec > 60) return 0
+        return unixFromCivil(year, mon, day, hour, min, sec)
+    }
+
+    function monthFromName(m: string): number {
+        if (m == "Jan") return 1
+        if (m == "Feb") return 2
+        if (m == "Mar") return 3
+        if (m == "Apr") return 4
+        if (m == "May") return 5
+        if (m == "Jun") return 6
+        if (m == "Jul") return 7
+        if (m == "Aug") return 8
+        if (m == "Sep") return 9
+        if (m == "Oct") return 10
+        if (m == "Nov") return 11
+        if (m == "Dec") return 12
+        return 0
+    }
+
+    function isLeap(y: number): boolean {
+        return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    }
+
+    function daysInMonth(y: number, m: number): number {
+        if (m == 2) return isLeap(y) ? 29 : 28
+        if (m == 4 || m == 6 || m == 9 || m == 11) return 30
+        return 31
+    }
+
+    // Days since 1 Jan 1970 for a civil date (year >= 1970).
+    function daysFromCivil(year: number, mon: number, day: number): number {
+        let days = 0
+        for (let y = 1970; y < year; y++) days += isLeap(y) ? 366 : 365
+        for (let m = 1; m < mon; m++) days += daysInMonth(year, m)
+        return days + day - 1
+    }
+
+    function unixFromCivil(year: number, mon: number, day: number, hour: number, min: number, sec: number): number {
+        return daysFromCivil(year, mon, day) * 86400 + hour * 3600 + min * 60 + sec
+    }
+
+    // Split Unix seconds back into the requested calendar field (UTC).
+    function civilFromUnix(t: number, unit: TimeUnit): number {
+        let days = Math.floor(t / 86400)
+        let rem = t - days * 86400
+        if (unit == TimeUnit.Hour) return Math.floor(rem / 3600)
+        if (unit == TimeUnit.Minute) return Math.floor(rem / 60) % 60
+        if (unit == TimeUnit.Second) return rem % 60
+        let year = 1970
+        while (true) {
+            let dy = isLeap(year) ? 366 : 365
+            if (days < dy) break
+            days -= dy
+            year++
+        }
+        if (unit == TimeUnit.Year) return year
+        let mon = 1
+        while (true) {
+            let dm = daysInMonth(year, mon)
+            if (days < dm) break
+            days -= dm
+            mon++
+        }
+        if (unit == TimeUnit.Month) return mon
+        return days + 1                       // Day
     }
 
     /**
@@ -109,6 +376,7 @@ namespace WiFi {
     //% group="UartWiFi"
     //% expandableArgumentMode="enabled"
     //% apiKey.defl="your Write API Key"
+    //% weight=60
     export function sendToThingSpeak(apiKey: string, field1: number = 0, field2: number = 0, field3: number = 0, field4: number = 0, field5: number = 0, field6: number = 0, field7: number = 0, field8: number = 0) {
         let result = 0
         let retry = 2
@@ -155,6 +423,7 @@ namespace WiFi {
     //% value1.defl="Hello"
     //% value2.defl="Calliope"
     //% value3.defl="mini"
+    //% weight=50
     export function sendToIFTTT(event: string, key: string, value1: string, value2: string, value3: string) {
         let result = 0
         let retry = 2
@@ -279,6 +548,7 @@ namespace WiFi {
 
     //% block="Adafruit IO GET|Username %username|AIO Key %aioKey|Feed %feed"
     //% group="UartWiFi"
+    //% weight=65
     export function adafruitIOGetValue(username: string, aioKey: string, feed: string): string {
         clearSerialBuffer()
 
@@ -362,6 +632,7 @@ namespace WiFi {
         */
     //% block="Adafruit IO POST|Username %username|AIO Key %aioKey|Feed %feed|Value %value"
     //% group="UartWiFi"
+    //% weight=70
     export function adafruitIOPost(username: string, aioKey: string, feed: string, value: string) {
         serial.readString() // dump old data 
         basic.pause(20)
@@ -646,7 +917,7 @@ namespace WiFi {
      * State of a web dashboard toggle (on = true).
      */
     //% block="web toggle %which"
-    //% group="Web Controls"
+    //% group="Access Point"
     export function toggle(which: WebControl): boolean {
         return ctrlToggle[which]
     }
@@ -655,7 +926,7 @@ namespace WiFi {
      * Value of a web dashboard slider (0-100).
      */
     //% block="web slider %which"
-    //% group="Web Controls"
+    //% group="Access Point"
     export function slider(which: WebControl): number {
         return ctrlSlider[which]
     }
