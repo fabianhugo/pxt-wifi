@@ -9,6 +9,7 @@
     "files": [
         "main.ts",
         "README.md",
+        "softserial.ts",
         "_locales/de/main-strings.json",
         "_locales/de/main-jsdoc-strings.json",
         "_locales/it/main-strings.json",

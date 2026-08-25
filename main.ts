@@ -27,6 +27,9 @@ enum TimeUnit {
     //% block="second"
     Second = 5
 }
+let debugMODE = true
+let debugTXPIN = DigitalPin.P2
+let debugBAUD = softSerial.BaudRate.Baud4800 
 /**
  * Functions to operate Grove module.
  */
@@ -60,6 +63,12 @@ namespace WiFi {
             rxPin,
             BaudRate.BaudRate115200
         )
+        // The pxt default RX buffer is only 64 bytes. At 115200 baud that is
+        // ~5.5 ms of data -- far too small if anything blocks before we read
+        // (notably the debug logger, which bit-bangs at 4800 baud and can hold
+        // the CPU for ~100 ms). The AP path already did this; station mode did
+        // not, so replies to long commands like CIPSTART were silently lost.
+        serial.setRxBufferSize(254)
 
         // Wait until the module actually answers AT before configuring. On a cold
         // boot the WiFi module powers up together with the Calliope and may still
@@ -126,18 +135,29 @@ namespace WiFi {
     // website. Every HTTP server sends it in the fixed RFC 7231 format
     // ("Date: Wed, 19 Aug 2026 15:43:39 GMT"), so no JSON, no API key, no TLS.
     //
-    // The result is cached: the fetch happens at most every TIME_REFRESH_MS, and
-    // in between the clock is advanced from input.runningTime(). "Internet OK?"
-    // just reports whether the last fetch worked, so the blocks can be called in
-    // a fast loop without hitting the network every time.
+    // The result is cached for TIME_REFRESH_MS (30 s): a block call older than
+    // that re-fetches from the internet, otherwise the cached time is advanced
+    // locally from input.runningTime(). That keeps the blocks live without a
+    // network round trip -- and its ~1.4 s stall -- on every single call.
     // =====================================================================
 
-    // Mozilla's captive-portal endpoint: meant for exactly this kind of
-    // unauthenticated probe, plain HTTP, and an 8-byte body.
-    const TIME_HOST = "detectportal.firefox.com"
-    const TIME_PATH = "/success.txt"
-    const TIME_REFRESH_MS = 600000        // re-fetch at most every 10 minutes
-    const TIME_RETRY_MS = 15000           // ...but after a failure, retry sooner
+    // Primary host. Short name, stable, IANA-reserved for exactly this kind of
+    // use. (It is served via Cloudflare, hence "Server: cloudflare" in replies.)
+    const TIME_HOST = "example.com"
+    const TIME_PATH = "/"
+    // Fallback: a bare IPv4 literal, so CIPSTART needs no DNS at all -- useful
+    // when a name resolves to IPv6 first on firmware without it, or DNS is slow.
+    // 1.1.1.1 answers plain HTTP on port 80 with a normal Date header (a 301 to
+    // HTTPS, which is fine: we only read the header, never follow the redirect).
+    const TIME_HOST2 = "1.1.1.1"
+    const TIME_PATH2 = "/"
+    // How stale the cached time may get before the next block call re-fetches it
+    // from the internet. Short, so the blocks read as a live clock -- but not
+    // zero: one fetch blocks ~1.4 s (and much longer if the host is unreachable),
+    // so fetching on literally every call would stall a loop and make reading
+    // hour and minute cost two round trips that could disagree.
+    const TIME_REFRESH_MS = 30000         // re-fetch when older than 30 s
+    const TIME_RETRY_MS = 15000           // after a failure, wait this long
 
     let netEpochSec = 0                   // Unix seconds at the moment of the fetch
     let netDeviceMs = 0                   // runningTime() at that same moment
@@ -172,9 +192,33 @@ namespace WiFi {
         return netEpochSec + Math.floor((input.runningTime() - netDeviceMs) / 1000)
     }
 
+    // UTC seconds -> local seconds, applying the Central European rule
+    // (CET = UTC+1, CEST = UTC+2 between the last Sunday of March and the last
+    // Sunday of October, both switching at 01:00 UTC).
+    function toLocal(t: number): number {
+        return t + (isSummerTime(t) ? 7200 : 3600)
+    }
+
+    function isSummerTime(t: number): boolean {
+        let year = civilFromUnix(t, TimeUnit.Year)
+        let start = lastSundayUtc(year, 3) + 3600      // 01:00 UTC, last Sun March
+        let end = lastSundayUtc(year, 10) + 3600       // 01:00 UTC, last Sun October
+        return t >= start && t < end
+    }
+
+    // Unix seconds for 00:00 UTC on the last Sunday of the given month.
+    function lastSundayUtc(year: number, mon: number): number {
+        let day = daysInMonth(year, mon)
+        let t = unixFromCivil(year, mon, day, 0, 0, 0)
+        // 1 Jan 1970 was a Thursday, so weekday = (days + 4) % 7, 0 = Sunday.
+        let dow = (Math.floor(t / 86400) + 4) % 7
+        return t - dow * 86400
+    }
+
     /**
      * One part (year, month, day, hour, minute or second) of the current time
-     * from the internet, in UTC. Returns 0 if it could not be fetched.
+     * from the internet, in Central European time (CET/CEST, 24 h, with daylight
+     * saving applied automatically). Returns 0 if it could not be fetched.
      */
     //% block="internet time %unit"
     //% group="UartWiFi"
@@ -182,7 +226,7 @@ namespace WiFi {
     export function internetTime(unit: TimeUnit): number {
         let t = internetTimestamp()
         if (t == 0) return 0
-        return civilFromUnix(t, unit)
+        return civilFromUnix(toLocal(t), unit)
     }
 
     // Fetch only when we have nothing, or the cached time is stale. Everything
@@ -201,7 +245,11 @@ namespace WiFi {
         if (netLastTry != 0 && (now - netLastTry) < wait) return
         netLastTry = now
         netBusy = true
-        let epoch = fetchNetDate()
+        // Try the named host, then a bare IP. CIPSTART can hang with no reply at
+        // all when DNS is slow or resolves to IPv6 on firmware without it -- the
+        // IP fallback removes DNS from the path entirely.
+        let epoch = fetchNetDate(TIME_HOST, TIME_PATH)
+        if (epoch == 0) epoch = fetchNetDate(TIME_HOST2, TIME_PATH2)
         netTimeOk = epoch > 0
         if (netTimeOk) {
             netEpochSec = epoch
@@ -226,24 +274,43 @@ namespace WiFi {
     //     works without changing it.
     // The reply is "+IPD,<len>:<data>" framed, but we don't parse that -- we just
     // scan the raw stream for the Date header.
-    function fetchNetDate(): number {
+    function fetchNetDate(host: string, path: string): number {
         clearSerialBuffer()
 
         sendAtCmd("AT+CIPCLOSE")
         waitAtResponse("OK", "ERROR", "None", 1000)
 
-        sendAtCmd("AT+CIPSTART=\"TCP\",\"" + TIME_HOST + "\",80")
-        if (waitAtResponse("OK", "ALREADY CONNECTED", "ERROR", 5000) == 3) {
-            return 0                          // could not connect
+        sendAtCmd("AT+CIPSTART=\"TCP\",\"" + host + "\",80")
+        // Only 1 or 2 mean we are connected. The old check bailed only on
+        // "ERROR" (== 3), so a TIMEOUT (== 0) fell through and we sent a request
+        // into a socket that was never opened -- the intermittent failure seen
+        // in the UART log. DNS for a new host can take a while, hence 10 s.
+        // ESP-AT answers "CONNECT" then "OK". Accept either, plus the
+        // "ALREADY CONNECTED" case. (Matching "OK" is safe here because the echo
+        // of AT+CIPSTART does not itself contain "OK" -- unlike AT+CIPSEND.)
+        let conn = waitAtResponse("CONNECT", "ALREADY CONNECTED", "ERROR", 10000)
+        if (conn == 3) return 0               // explicit ERROR
+        if (conn == 0) {
+            // Timed out waiting for CONNECT. Do NOT fall through as the previous
+            // version did -- that sent a request into a socket that was never
+            // opened, which is exactly the intermittent failure in the UART log.
+            return 0
         }
 
+        // HEAD, not GET: we only ever read the "Date:" response header, and HEAD
+        // returns the identical headers with no body. example.com's GET reply is
+        // ~867 bytes (chunked HTML) that the module would have to funnel through
+        // the UART and this loop would have to buffer, for nothing.
         let req =
-            "GET " + TIME_PATH + " HTTP/1.1\r\n" +
-            "Host: " + TIME_HOST + "\r\n" +
+            "HEAD " + path + " HTTP/1.1\r\n" +
+            "Host: " + host + "\r\n" +
             "Connection: close\r\n\r\n"
 
         sendAtCmd("AT+CIPSEND=" + req.length)
-        if (waitAtResponse(">", "OK", "ERROR", 2000) == 3) {
+        // Wait for the ">" prompt ONLY. Passing "OK" as a target here matched the
+        // module's echo of the command itself ("AT+CIPSEND=80 ... OK"), so this
+        // succeeded even when no prompt ever came.
+        if (waitAtResponse(">", "ERROR", "busy", 3000) != 1) {
             sendAtCmd("AT+CIPCLOSE")
             waitAtResponse("OK", "ERROR", "None", 1000)
             return 0
@@ -280,6 +347,9 @@ namespace WiFi {
                 if (buf.length > 100 && (input.runningTime() - lastData) > 2000) break
             }
         }
+
+        // Safe to log now: the whole reply has already been read.
+        debugLog(buf.length > 0 ? buf : "[no data]")
 
         sendAtCmd("AT+CIPCLOSE")
         waitAtResponse("OK", "ERROR", "None", 1000)
@@ -531,18 +601,42 @@ namespace WiFi {
         while ((input.runningTime() - start) < timeout) {
             buffer += serial.readString()
 
-            if (buffer.includes(target1)) return 1
-            if (buffer.includes(target2)) return 2
-            if (buffer.includes(target3)) return 3
+            if (buffer.includes(target1)) { debugLog(buffer); return 1 }
+            if (buffer.includes(target2)) { debugLog(buffer); return 2 }
+            if (buffer.includes(target3)) { debugLog(buffer); return 3 }
 
             basic.pause(100)
         }
 
+        debugLog(buffer + " [TIMEOUT]")
         return 0
     }
 
+    // The last command sent, waiting to be printed by the debug logger.
+    let pendingCmd = ""
+
     function sendAtCmd(cmd: string) {
         serial.writeString(cmd + "\u000D\u000A")
+        // NOTE: the debug echo is deliberately NOT written here. softSerial
+        // bit-bangs at 4800 baud and busy-waits: logging a ~50 char command
+        // blocks for ~110 ms, during which the module's reply (up to ~1150 bytes
+        // at 115200 baud) overruns the RX buffer and is lost. That made long
+        // commands like CIPSTART appear to get no answer at all. The command is
+        // instead recorded and flushed by waitAtResponse AFTER the reply has been
+        // read.
+        pendingCmd = cmd
+    }
+
+
+    // Print ">>command" then "<<reply" once the reply is already in hand, so the
+    // slow bit-banged logging can never eat the reply it is meant to show.
+    function debugLog(reply: string) {
+        if (!debugMODE) return
+        if (pendingCmd.length > 0) {
+            softSerial.writeLine(debugTXPIN, debugBAUD, ">>" + pendingCmd)
+            pendingCmd = ""
+        }
+        softSerial.writeLine(debugTXPIN, debugBAUD, "<<" + reply)
     }
 
 
