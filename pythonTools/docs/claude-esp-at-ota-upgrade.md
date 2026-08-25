@@ -386,3 +386,266 @@ working tree was on. **Check `git describe --tags` before quoting the binary
 list.** The docs are `.. only::`-scoped per chip, so a grep hit for a version
 string says nothing about which chip's section it belongs to — always confirm the
 enclosing `.. only::` directive.
+
+### 2026-08-25 — OTA exposed as MakeCode blocks (main.ts)
+
+Added two blocks to the WiFi extension (`main.ts`, group *UartWiFi*, all
+`advanced=true`), following `at_ota_upgrade.py`:
+
+- **`upgrade WiFi firmware (OTA)`** → `upgradeFirmware()` — `AT+CIUPDATE=1`
+  (HTTPS, **blocking**), narrating nothing but tracking the `+CIPUPDATE:<state>`
+  codes. Returns true only when state **4** *and* a final `OK` are seen.
+- **`restore previous WiFi firmware`** → `restoreFirmware()` — `AT+SYSROLLBACK`,
+  no network.
+- **`firmware upgrade state`** → `upgradeState()` — last `+CIPUPDATE` code
+  (0/1/2/3/4/-1) for diagnosing a failure.
+
+Decisions, all inherited from the script and the notes above:
+
+- **Blocking mode** (`AT+CIUPDATE=1`, no trailing `,1`). Non-blocking is unusable
+  here: the docs warn `OK` "does not necessarily come before" the `+CIPUPDATE`
+  lines, so a boolean return could not be trusted.
+- **`OK` alone is not success.** The reply must reach state 4 first — there is an
+  explicit regression test for an `OK` that never reached state 4 returning
+  `false`.
+- **240 s timeout**, matching `OTA_TIMEOUT` in the script (docs say 3 min).
+- **`isWifiConnected = false`** after either operation: the module restarts and
+  credentials do not survive, so `wifiOK()` must not keep claiming a connection.
+  8 s pause then `clearSerialBuffer()` before returning, mirroring the script.
+- No `AT+USEROTA` block. It needs a URL the user must host, plus a two-step
+  `>`-prompt upload — the wrong shape for a block, and the cloud path is what
+  "upgrade via Espressif server" asked for.
+- No `AT+RESTORE`. It wipes Wi-Fi credentials to factory defaults, which is a
+  much bigger hammer than "reset to the old firmware".
+
+**Caveat carried into the block comment:** per the 2026-08-19 finding above,
+`AT+SYSROLLBACK` only works *after* an upgrade — a module still on its original
+firmware has no second image, and pre-v4.x firmware lacks the command entirely.
+The block returns `false` in both cases rather than pretending.
+
+Verified host-side against a mocked module: success path (states 1→2→3→4 + OK),
+`+CIPUPDATE:-1`, bare `ERROR`, `OK`-without-state-4, and a total stall (waits the
+full 240 s then fails); rollback OK and rollback ERROR. Existing time blocks
+re-checked for regressions. **Not run on hardware** — and unlike the time blocks,
+a bad OTA has real consequences, so the first hardware run should be attended.
+
+### 2026-08-25 (later) — logging bug, version block, on-screen progress
+
+**Bug: `>>AT+CIUPDATE=1` never appeared in the debug UART.** `sendAtCmd` only
+stashes the command in `pendingCmd`; `debugLog()` prints it together with the
+reply. That deferral exists so the slow bit-banged logger cannot eat a reply that
+is about to arrive — but for OTA the reply is *minutes* away, so the command line
+only appeared after the upgrade finished, or never if the device was reset first.
+
+Added `debugLogCmd()`, which flushes just the `>>command` line, and called it
+right after `sendAtCmd("AT+CIUPDATE=1")`. Safe precisely because the module
+cannot answer for several seconds. Regression test asserts the line is the
+**first** thing logged.
+
+**Is there progress? Partly.** The module emits only the four `+CIPUPDATE`
+states (server found / connected / got version / done) — there is no byte or
+percentage feedback during the download, which is the long part. So a true
+percentage bar is not possible.
+
+**On-screen display during the upgrade** (`otaAnimate`, called from the existing
+wait loop):
+
+- **bottom row** = state gauge, one LED per completed `+CIPUPDATE` state — real
+  progress, 0–4;
+- **top row** = a dot chasing left→right each frame, so a state that takes a long
+  time still looks alive rather than frozen.
+
+Driven from inside the read loop (~every 100 ms), using only `led.plot`/`unplot`.
+Deliberately **not** `basic.showAnimation` or a second fiber: those pause
+internally, which would stall the read loop and lose the module's output — the
+same class of bug as the softSerial blocking issue. `basic.clearScreen()` on exit.
+
+**New block: `WiFi firmware version`** → `AT+GMR`, returning e.g. `"4.1.1.0"`.
+Parses the `AT version:` line and stops at `(`, dropping the
+`(commit - target - date)` decoration exactly as `at_ota_upgrade.py:230` does, so
+before/after comparisons match as plain strings. Empty string if the module does
+not answer. Reads the whole reply rather than waiting on `OK`, because `AT+GMR`
+prints several lines and the wanted one comes first.
+
+Verified: version parsing with and without the paren decoration and on `ERROR`;
+the command-logged-first assertion; gauge reflects the state; chase dot advances
+and erases the previous LED; screen cleared afterwards.
+
+### 2026-08-25 (UI pass) — display changes and AT+RESTORE after rollback
+
+**Display, per user feedback:**
+
+- `basic.clearScreen()` now runs at the **start** of `upgradeFirmware()`, before
+  any waiting, so the OTA begins on a blank screen.
+- **Progress gauge removed.** The user observed it rises to 3 LEDs within seconds
+  and then sits there for the whole download — because `+CIPUPDATE:3` ("got the
+  upgrade version") arrives early and the long download that follows emits
+  nothing. A gauge that freezes reads as a hang, so it was worse than no gauge.
+- **Dots → columns.** `otaAnimate(frame)` now sweeps a full 5-LED vertical bar
+  left to right; the whole screen moves, which is legible from across a room.
+- **Slowed 100 ms → ~400 ms per step** (advance on every 4th loop tick). The read
+  loop still ticks at 100 ms — only the animation is decimated, so nothing about
+  the serial timing changed.
+
+**`AT+RESTORE` after `AT+SYSROLLBACK` — the user was right.**
+
+Per the vendor caveat recorded above, a downgrade's real hazard is persistent
+state: newer firmware may write NVS / `at_customize` structures an older build
+cannot parse. The notes call `AT+RESTORE` "close to mandatory on a downgrade",
+and `at_ota_upgrade.py` offers it via `--restore`. Rollback *is* a downgrade, so
+`restoreFirmware()` now issues `AT+RESTORE` after a successful rollback, waits
+out the second restart, and returns.
+
+Consequences handled:
+
+- It **erases saved Wi-Fi credentials**, so the block is renamed
+  **"restore previous WiFi firmware (clears WiFi settings)"** — a destructive
+  side effect belongs in the block name, not only in a comment.
+- `AT+RESTORE` runs **only if the rollback succeeded**. Wiping credentials after
+  a rollback that never happened would be pure damage; there is a regression test
+  asserting no `AT+RESTORE` on the `ERROR` path.
+
+**Logging detail:** the two immediate `debugLogCmd()` calls initially added in
+`restoreFirmware` were removed. `waitAtResponse` follows each command directly
+and already prints `>>cmd` with the reply; flushing early blocks ~39 ms, which
+exceeds what the 254-byte RX buffer holds at 115200 baud (~22 ms) and could
+swallow the `OK`. `debugLogCmd()` remains correct **only** for `AT+CIUPDATE`,
+whose reply is minutes away.
+
+Verified: clear-at-start happens before any wait; a frame lights a full column of
+5 and fully erases the previous one; the sweep covers all 5 columns; `AT+RESTORE`
+is ordered after `AT+SYSROLLBACK`; and no `AT+RESTORE` when rollback fails.
+
+### 2026-08-25 — "I upgraded, then power-cycled: did I lose the rollback?"
+
+Almost certainly not. Reasoning from the facts already recorded above:
+
+- **OTA writes to the *other* partition.** The hardware run showed the device
+  running from `ota_1` (0x230000) with the previous image still in `ota_0`
+  (0x60000). Nothing erases `ota_0`, and a power cycle does not alter flash
+  contents.
+- **`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`** means a new image must confirm
+  itself valid or the bootloader reverts automatically. So either the new
+  firmware booted and self-confirmed (both slots intact, rollback available), or
+  it was broken and the bootloader already put the old one back. Neither outcome
+  strands the device.
+- **`CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n`** — no secure-version counter can
+  refuse an older image.
+
+The one genuine loss scenario is a power cut **during** the flash write, which
+leaves the target partition incomplete — but then the bootloader keeps running
+the *old* image, so the user would still be on their previous firmware, not
+stuck on the new one.
+
+Rather than reason at the user, added two **non-destructive** blocks so the
+device can answer for itself:
+
+- **`previous WiFi firmware available?`** → boolean.
+- **`previous WiFi firmware version`** → the rollback slot's version string.
+
+Both issue the **query** form `AT+SYSROLLBACK?` only. There is a regression test
+asserting the executing form `AT+SYSROLLBACK` is never sent — getting that wrong
+would roll the device back merely for asking a question.
+
+Parser takes the text inside the *second* quoted pair of
+`+SYSROLLBACK:<run_addr>,"<run_ver>",<rb_addr>,"<rb_ver>"`. Tested against the
+exact hardware string recorded above
+(`...,"v4.2.0.0",0x60000,"v2.4.0.0-649-gbe332568-dirty"`), a simple version, an
+empty slot, and `ERROR` from pre-v4.x firmware.
+
+Reminder from the earlier finding: an alarming-looking descriptor such as
+`v2.4.0.0-649-gbe332568-dirty` is **stock v3.3.0.0** — it is `git describe`
+output, not evidence of a custom build.
+
+### 2026-08-25 — Both OTA slots now hold v4.2.0.0: the original is gone
+
+User reported rollback not working and supplied:
+
+```
++SYSROLLBACK:0x230000,"v4.2.0.0",0x60000,"v4.2.0.0"
+```
+
+Compare with the state recorded after the *first* upgrade (line ~199):
+
+```
++SYSROLLBACK:0x230000,"v4.2.0.0",0x60000,"v2.4.0.0-649-gbe332568-dirty"
+```
+
+| | running (`ota_1`) | rollback slot (`ota_0`) |
+| --- | --- | --- |
+| after first OTA | v4.2.0.0 | `v2.4.0.0-649-g...` = stock **v3.3.0.0** |
+| now | v4.2.0.0 | **v4.2.0.0** |
+
+**Cause: the OTA was run more than once.** Each OTA writes to whichever
+partition is *not* running, alternating. Upgrade #1 wrote v4.2.0.0 into `ota_1`
+and left the factory v3.3.0.0 in `ota_0`. Upgrade #2, running from `ota_1`, wrote
+v4.2.0.0 into `ota_0` — overwriting the only copy of the original image.
+
+**The power cycle was not the cause.** Flash contents survive power loss, and the
+partition layout above is unchanged. `AT+SYSROLLBACK` still "works" mechanically;
+it just switches between two identical images, which looks like nothing
+happening.
+
+**Consequence for the blocks:** `previous WiFi firmware available?` returns true
+here (the slot is populated and parseable) even though rolling back is pointless.
+Comparing it against `WiFi firmware version` is the honest check — if the two
+match, there is nothing to go back to. Worth considering a block that reports
+this directly rather than leaving the user to compare strings.
+
+**Recovery — the original is still obtainable.** `AT+CIUPDATE` cannot help (the
+`<version>` parameter is compatibility matching, not target selection, so the
+cloud only ever gives "latest"). But anti-rollback is disabled
+(`CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK=n`), so flashing an older image directly
+works, which is exactly what the script's own header documents:
+
+1. Download `ESP32-C3-MINI-1-AT-V3.3.0.0.zip` — verified reachable 2026-08-25 at
+   `https://dl.espressif.com/esp-at/firmwares/esp32c3/ESP32-C3-MINI-1-AT-V3.3.0.0.zip`
+   (C3 binaries ≤ v4.1.1.0 are plain zips, no download form — see line ~45).
+2. `./at_ota_upgrade.py --serve <path>/esp-at.bin --restore`
+   (`--serve` runs a local HTTP server and drives `AT+USEROTA`; `--url` if hosting
+   it elsewhere).
+3. `--restore` matters here: this is a downgrade, so `AT+RESTORE` clears NVS /
+   `at_customize` state the newer build may have written. It erases Wi-Fi
+   credentials — re-provision afterwards.
+
+Note this writes v3.3.0.0 into the *inactive* slot, so afterwards the rollback
+slot holds v4.2.0.0 again — the escape hatch is restored in the other direction.
+
+### 2026-08-25 — Recovery to 3.3.0.0 succeeded; AT+RST vs AT+RESTORE
+
+The downgrade worked. Two notes from it.
+
+**The `--serve` argument must be the unpacked image, not the zip.** First attempt
+served `ESP32-C3-MINI-1-AT-V3.3.0.0.zip` directly and failed with
+`ConnectionResetError` mid-download plus the generic "Pinned OTA failed" — the
+device began fetching, found no valid image header, and dropped the connection.
+`AT+USEROTA` wants the single OTA app image, for C3
+`ESP32-C3-MINI-1-AT-V3.3.0.0/build/esp-at.bin`. Not the `factory/` image and not
+the individual `bootloader.bin` / `partition-table.bin`, which are for wired
+esptool flashing at fixed offsets. Sanity check: a valid image is ~1–2 MB and its
+first byte is `0xE9`.
+
+*Possible script improvement:* reject a file whose first byte is not `0xE9` (or
+whose name ends `.zip`) before starting the server, instead of letting the device
+discover it mid-flash.
+
+**`AT+RST` is not a substitute for `AT+RESTORE` in the rollback block.** The user
+saw `[5/5] Restarting to boot the new image → AT+RST` during the `--serve`
+downgrade and asked whether the rollback block should use that instead. It should
+not — they solve different problems, and the script itself uses both:
+
+| command | role |
+| --- | --- |
+| `AT+RST` | plain reboot. Needed after `AT+USEROTA` / `AT+CIUPDATE`, which flash the image but do **not** restart. |
+| `AT+RESTORE` | clears NVS / `at_customize` to factory defaults, then reboots. The downgrade-safety step. |
+
+Decisive detail: `do_rollback()` issues **no `AT+RST` at all** — `AT+SYSROLLBACK`
+restarts the device itself ("Rollback issued; device is restarting"). `--restore`
+is then applied optionally, exactly as in the OTA path. So the `AT+RST` the user
+saw belongs to the OTA path only.
+
+Since rollback is *always* a downgrade, and the notes above call `AT+RESTORE`
+"close to mandatory on a downgrade", swapping it for `AT+RST` would drop the one
+protection that matters most there. `restoreFirmware()` already mirrors
+`do_rollback()` exactly — `AT+SYSROLLBACK` → 8 s → `AT+RESTORE` → 6 s, no
+`AT+RST` — and is left unchanged. Decision confirmed with the user.

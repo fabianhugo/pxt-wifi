@@ -549,6 +549,291 @@ namespace WiFi {
         }
     }
 
+    // =====================================================================
+    // Firmware upgrade (OTA)
+    //
+    // Mirrors pythonTools/at_ota_upgrade.py, which was validated on real
+    // hardware. Two operations:
+    //   AT+CIUPDATE   - download and install from Espressif's cloud server
+    //   AT+SYSROLLBACK - switch back to the image in the other OTA partition
+    //
+    // Both are slow and must not be interrupted, so they are plain blocking
+    // calls that report success as a boolean rather than reporting progress.
+    // =====================================================================
+
+    // The docs put the OTA process timeout at 3 minutes; allow headroom for a
+    // slow link (the Python tool uses 240 s for the same reason).
+    const OTA_TIMEOUT_MS = 240000
+
+    // Progress of the last upgrade, from the +CIPUPDATE:<state> lines:
+    // 0 = not started, 1 = server found, 2 = connected, 3 = got version,
+    // 4 = upgrade done, -1 = failed.
+    let otaState = 0
+
+    /**
+     * Upgrade the WiFi module's firmware over the air from Espressif's official
+     * server. Needs station mode ("Setup Wifi") and internet.
+     *
+     * Takes several minutes. DO NOT power off the Calliope or the module while
+     * this runs. The module restarts itself afterwards, so set up WiFi again.
+     * Returns true only if the upgrade completed.
+     *
+     * Note: the cloud server only serves official Espressif builds, and the
+     * version cannot be chosen.
+     */
+    //% block="upgrade WiFi firmware (OTA)"
+    //% group="UartWiFi"
+    //% weight=20
+    //% advanced=true
+    export function upgradeFirmware(): boolean {
+        otaState = 0
+        basic.clearScreen()                   // start from a blank display
+        clearSerialBuffer()
+
+        // Blocking mode (no trailing ",1"). The docs warn that in non-blocking
+        // mode the "OK" does not necessarily arrive before the +CIPUPDATE lines,
+        // which would make the result impossible to read reliably.
+        // Mode 1 = HTTPS. The Python tool defaults to this too.
+        sendAtCmd("AT+CIUPDATE=1")
+        // Print the command NOW rather than leaving it for debugLog at the end:
+        // the reply is minutes away, so waiting would make the log look as
+        // though nothing was ever sent. Safe here because the module cannot
+        // answer for several seconds.
+        debugLogCmd()
+
+        // Collect until the module reports done, or fails, or we run out of
+        // patience. We keep the whole buffer: the +CIPUPDATE:<state> lines and
+        // the final OK/ERROR can arrive in the same read.
+        let buf = ""
+        let start = input.runningTime()
+        let frame = 0
+        while ((input.runningTime() - start) < OTA_TIMEOUT_MS) {
+            buf += serial.readString()
+            if (buf.includes("+CIPUPDATE:4")) otaState = 4
+            else if (buf.includes("+CIPUPDATE:3")) otaState = 3
+            else if (buf.includes("+CIPUPDATE:2")) otaState = 2
+            else if (buf.includes("+CIPUPDATE:1")) otaState = 1
+            if (buf.includes("+CIPUPDATE:-1")) { otaState = -1; break }
+            // Success is state 4 AND a final OK -- OK alone is not enough.
+            if (otaState == 4 && buf.includes("OK")) break
+            if (buf.includes("ERROR") || buf.includes("FAIL")) break
+            // Keep the buffer bounded without losing a partially received line.
+            if (buf.length > 1024) buf = buf.substr(buf.length - 512)
+
+            // Show that the upgrade is alive. There is no byte-level progress
+            // from the module -- only the four +CIPUPDATE states -- so the
+            // bottom row is a state gauge (one LED per completed state) and a
+            // dot chases across the top row so a stalled state still looks
+            // different from a frozen device.
+            // The loop ticks every ~100 ms; advance the column every 4th tick
+            // (~400 ms) so the sweep is calm rather than frantic.
+            if (frame % 4 == 0) otaAnimate(Math.floor(frame / 4))
+            frame++
+
+            basic.pause(100)
+        }
+        basic.clearScreen()
+
+        debugLog(buf.length > 0 ? buf : "[no data]")
+        if (otaState != 4) return false
+
+        // The module reboots into the new image; give it time before anyone
+        // talks to it again.
+        basic.pause(8000)
+        clearSerialBuffer()
+        isWifiConnected = false               // credentials do not survive
+        return true
+    }
+
+    /**
+     * Switch the WiFi module back to the firmware it had before the last
+     * upgrade (the image in its other OTA slot). Uses no network.
+     *
+     * Also runs AT+RESTORE afterwards: going back to an older build can leave
+     * settings it cannot read, so the module is reset to factory defaults. This
+     * ERASES the saved WiFi settings -- run "Setup Wifi" again afterwards.
+     *
+     * Only works if an upgrade has actually been done before -- a module still
+     * on its original firmware has no second image to go back to, and older
+     * firmware may not support the command at all. Returns true if the rollback
+     * was accepted.
+     */
+    //% block="restore previous WiFi firmware (clears WiFi settings)"
+    //% group="UartWiFi"
+    //% weight=19
+    //% advanced=true
+    export function restoreFirmware(): boolean {
+        clearSerialBuffer()
+
+        // AT+SYSROLLBACK returns OK and then restarts. Firmware that predates
+        // the command (pre-v4.x) answers ERROR, which is the honest "no" here.
+        // No debugLogCmd() here: waitAtResponse follows immediately and prints
+        // ">>cmd" together with the reply. Flushing now would block ~39 ms --
+        // longer than the 254-byte RX buffer holds at 115200 baud (~22 ms) --
+        // and could swallow the OK. Only the OTA command, whose reply is minutes
+        // away, is safe to log early.
+        sendAtCmd("AT+SYSROLLBACK")
+        let r = waitAtResponse("OK", "ERROR", "None", 10000)
+        if (r != 1) return false
+
+        basic.pause(8000)                     // let it come back up
+        clearSerialBuffer()
+
+        // Rollback is a DOWNGRADE, and the vendor docs warn that newer firmware
+        // can leave NVS / at_customize structures the older build cannot parse.
+        // AT+RESTORE resets that persistent state to factory defaults and is
+        // "close to mandatory on a downgrade" (see
+        // pythonTools/docs/claude-esp-at-ota-upgrade.md). It also erases the
+        // saved WiFi credentials -- which is why this block's name says so, and
+        // why setupWifi has to be run again afterwards.
+        sendAtCmd("AT+RESTORE")
+        waitAtResponse("OK", "ERROR", "ready", 10000)
+        basic.pause(6000)                     // it restarts again after RESTORE
+        clearSerialBuffer()
+
+        isWifiConnected = false               // credentials are gone
+        return true
+    }
+
+    /**
+     * The WiFi module's firmware version, e.g. "4.1.1.0". Empty string if the
+     * module does not answer. Useful to check before and after an upgrade.
+     */
+    //% block="WiFi firmware version"
+    //% group="UartWiFi"
+    //% weight=21
+    //% advanced=true
+    export function firmwareVersion(): string {
+        clearSerialBuffer()
+        sendAtCmd("AT+GMR")
+
+        // Collect the whole reply: AT+GMR prints several lines (AT / SDK / compile
+        // time / Bin version) and we want the first one, so waiting on "OK" with
+        // waitAtResponse would discard it.
+        let buf = ""
+        let start = input.runningTime()
+        while ((input.runningTime() - start) < 3000) {
+            buf += serial.readString()
+            if (buf.includes("OK") && buf.includes("AT version:")) break
+            if (buf.includes("ERROR")) break
+            basic.pause(50)
+        }
+        debugLog(buf.length > 0 ? buf : "[no data]")
+
+        // "AT version:4.1.1.0(abc - ESP32C3 - Jan 1 2025)" -> "4.1.1.0".
+        // Stop at "(" so the commit/target/date decoration is dropped and two
+        // versions can be compared as plain strings.
+        let key = "AT version:"
+        let i = buf.indexOf(key)
+        if (i < 0) return ""
+        let out = ""
+        for (let j = i + key.length; j < buf.length; j++) {
+            let c = buf.charAt(j)
+            if (c == "(" || c == "\r" || c == "\n") break
+            out += c
+        }
+        // Trim trailing spaces without relying on String.trim().
+        while (out.length > 0 && out.charAt(out.length - 1) == " ") {
+            out = out.substr(0, out.length - 1)
+        }
+        return out
+    }
+
+    /**
+     * True if the module has a previous firmware to go back to, i.e. whether
+     * "restore previous WiFi firmware" can work. Changes nothing.
+     *
+     * False means either the module has never been upgraded (so there is no
+     * second image) or its firmware is too old to support the query.
+     */
+    //% block="previous WiFi firmware available?"
+    //% group="UartWiFi"
+    //% weight=17
+    //% advanced=true
+    export function previousFirmwareAvailable(): boolean {
+        return rollbackSlotVersion().length > 0
+    }
+
+    /**
+     * The version stored in the module's rollback slot -- the firmware that
+     * "restore previous WiFi firmware" would go back to. Empty if there is none.
+     *
+     * Note this is the image's build descriptor, which can differ from the AT
+     * version string (e.g. "v2.4.0.0-649-g..." is stock v3.3.0.0). Changes
+     * nothing.
+     */
+    //% block="previous WiFi firmware version"
+    //% group="UartWiFi"
+    //% weight=16
+    //% advanced=true
+    export function rollbackSlotVersion(): string {
+        clearSerialBuffer()
+        // Query form only -- this does NOT roll anything back. Absent before
+        // v4.x, which answers ERROR.
+        sendAtCmd("AT+SYSROLLBACK?")
+
+        let buf = ""
+        let start = input.runningTime()
+        while ((input.runningTime() - start) < 3000) {
+            buf += serial.readString()
+            if (buf.includes("+SYSROLLBACK:") && buf.includes("OK")) break
+            if (buf.includes("ERROR")) break
+            basic.pause(50)
+        }
+        debugLog(buf.length > 0 ? buf : "[no data]")
+
+        // +SYSROLLBACK:<run_addr>,"<run_ver>",<rb_addr>,"<rb_ver>"
+        // The rollback version is the text inside the SECOND pair of quotes.
+        let i = buf.indexOf("+SYSROLLBACK:")
+        if (i < 0) return ""
+        let q = 0
+        let out = ""
+        let collecting = false
+        for (let j = i; j < buf.length; j++) {
+            let c = buf.charAt(j)
+            if (c == "\r" || c == "\n") break
+            if (c == "\"") {
+                q++
+                if (q == 3) collecting = true         // opening quote of rb_ver
+                else if (q == 4) break                // closing quote
+                continue
+            }
+            if (collecting) out += c
+        }
+        return out
+    }
+
+    /**
+     * How far the last firmware upgrade got: 0 = not started, 1 = server found,
+     * 2 = connected to server, 3 = got the new version, 4 = done, -1 = failed.
+     */
+    //% block="firmware upgrade state"
+    //% group="UartWiFi"
+    //% weight=18
+    //% advanced=true
+    export function upgradeState(): number {
+        return otaState
+    }
+
+    // One frame of the upgrade display, called from the OTA wait loop. A full
+    // column sweeps left to right, so the whole screen shows activity.
+    //
+    // No progress gauge: the module only reports four +CIPUPDATE states, and it
+    // reaches state 3 within seconds and then sits there for the entire
+    // download, so a gauge reads as "stuck" rather than as progress.
+    //
+    // Kept to plot/unplot so it never blocks. basic.showAnimation and friends
+    // pause internally, which would stall the read loop and lose the module's
+    // output.
+    function otaAnimate(frame: number) {
+        let col = frame % 5
+        let prev = (frame + 4) % 5
+        for (let y = 0; y < 5; y++) {
+            led.unplot(prev, y)
+            led.plot(col, y)
+        }
+    }
+
     /**
      * Send a raw message via TCP or UDP
      */
@@ -627,6 +912,17 @@ namespace WiFi {
         pendingCmd = cmd
     }
 
+
+    // Print ">>command" on its own, for a command whose reply will not arrive for
+    // a long time (OTA). Safe only when nothing is about to be received: the
+    // bit-banged logging blocks for ~100 ms.
+    function debugLogCmd() {
+        if (!debugMODE) return
+        if (pendingCmd.length > 0) {
+            softSerial.writeLine(debugTXPIN, debugBAUD, ">>" + pendingCmd)
+            pendingCmd = ""
+        }
+    }
 
     // Print ">>command" then "<<reply" once the reply is already in hand, so the
     // slow bit-banged logging can never eat the reply it is meant to show.

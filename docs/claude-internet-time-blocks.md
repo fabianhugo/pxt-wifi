@@ -199,3 +199,296 @@ Also asserts `CIPSEND` length has no `+2`, `CIPMUX` is never touched, stage code
 date suite. All pass.
 
 **Still unverified on hardware.**
+
+## 2026-08-19 (fourth pass) — works on hardware; simplification round
+
+User confirmed the blocks work on the device. Then asked what could be simplified,
+noting correctly that **"Internet OK?" should not need to poll the time**.
+
+### `internetOk` is now a real ping again (5 lines)
+
+The user's rule was: make it a plain ping unless that costs more lines than
+reusing the time fetch. It doesn't — the expensive part before was the *TCP
+fallback* for firmware without `AT+PING`, not the ping itself. Since the module
+demonstrably answers `AT+PING` (the block works on hardware), the fallback is
+dead weight:
+
+```ts
+export function internetOk(): boolean {
+    clearSerialBuffer()
+    sendAtCmd("AT+PING=\"" + TIME_HOST + "\"")
+    return waitAtResponse("+PING:", "ERROR", "timeout", 5000) == 1
+}
+```
+
+`internetOk` is now fully independent of the clock — no shared state, no fetch
+triggered, works standalone (which is what the user's original test program
+assumed). It does block up to 5 s on failure; that is inherent to a ping.
+
+### Removed
+
+- `lastTimeError` / `lastTimeReply` diagnostic blocks and the `netStage` /
+  `netRaw` state. They existed only to find the read bug, which is fixed. `netRaw`
+  also retained a ~1 KB string permanently, which matters on this heap.
+- `refreshNetTime` collapsed: the two staleness guards became one
+  (`wait = netTimeOk ? TIME_REFRESH_MS : TIME_RETRY_MS`), and the
+  `if/else` assigning `netTimeOk` became `netTimeOk = epoch > 0`.
+
+303 → 262 lines in the internet-clock region.
+
+### Kept deliberately, with reasons
+
+- **`findDateHeader` (line-anchored match, 12 lines).** The chosen host currently
+  sends only one `Date:` header, so this is not load-bearing today — but a proxy
+  or a host change adding `X-...-Date:` would produce a *silently wrong time*,
+  which is worse than no time. Cheap insurance.
+- **`netBusy` re-entry guard (2 lines).** `fetchNetDate` calls `basic.pause`, which
+  yields, so two user fibers (e.g. `forever` + `everyInterval`) can still overlap
+  even though there is now only one call site. This was a real, hard-to-diagnose
+  corruption source.
+- **Failure backoff (`TIME_RETRY_MS`).** A failed fetch costs several seconds; a
+  loop with no internet would otherwise retry nonstop.
+- **The validation block in `parseHttpDate`.** Guarantees a mangled/partial header
+  yields 0 rather than a bogus time.
+
+### Verification
+
+Re-ran everything after the edits: `internetOk` issues exactly one `AT+PING` and
+**no** `CIPSTART` (proving it no longer touches the time path) and leaves the
+clock unpopulated; time blocks still parse chunked `+IPD` replies at every chunk
+size 1–30; one fetch across 30 loop ticks; refresh after the window; backoff and
+recovery; re-entry guard. Plus the 506-case date suite. All pass.
+
+## 2026-08-19 (fifth pass) — UART log finds two AT handshake bugs; CET/CEST added
+
+The user added a bit-banged debug UART (`softserial.ts`) and captured the real AT
+conversation. It showed the failure directly:
+
+```
+>>AT+CIPSTART="TCP","detectportal.firefox.com",80
+<<AT+CIPSTART="TCP","d          <- truncated: no OK, no CONNECT
+>>AT+CIPSEND=80                 <- we sent anyway
+<<AT+CIPSEND=80  OK             <- this "OK" is the ECHO, not the ">" prompt
+>>AT+CIPCLOSE
+<<AT+CIPCLOSE  ERROR
+```
+
+### Bug 1 — connect failure fell through on TIMEOUT
+
+```ts
+if (waitAtResponse("OK", "ALREADY CONNECTED", "ERROR", 5000) == 3) return 0
+```
+
+`waitAtResponse` returns 3 only for the *third* target (`ERROR`). A **timeout
+returns 0**, which is not 3 — so when CIPSTART simply never answered (slow DNS on
+a first lookup), the code proceeded to CIPSEND on a socket that was never opened.
+That is precisely the "sometimes it works but often not" symptom. Now accepts
+only 1 or 2 (CONNECT / ALREADY CONNECTED) and bails on both ERROR *and* timeout.
+Timeout raised 5 s → 10 s for cold DNS.
+
+### Bug 2 — the ">" wait matched the command echo
+
+```ts
+if (waitAtResponse(">", "OK", "ERROR", 2000) == 3) { ... }
+```
+
+The module echoes the command and then prints `OK`. With `"OK"` as target2 this
+matched the echo, so the check "passed" even when no `>` prompt ever came. Now
+waits for `">"` only (`!= 1` fails).
+
+Both are the same class of mistake: `waitAtResponse`'s return codes are
+positional, and target strings can match the module's echo of our own command.
+
+### CET/CEST local time
+
+The HTTP `Date:` header is always GMT, so the hour read 12 instead of 14. Added
+the EU rule: CET = UTC+1, CEST = UTC+2 from 01:00 UTC on the last Sunday of March
+to 01:00 UTC on the last Sunday of October (`toLocal` / `isSummerTime` /
+`lastSundayUtc`, ~20 lines, no table).
+
+- `internetTime(unit)` now returns **local** CET/CEST, 24 h.
+- `internetTimestamp()` stays **UTC** — a Unix timestamp is UTC by definition, and
+  shifting it would make it wrong for logging/arithmetic.
+
+### Verification
+
+- **695 timezone points** vs Python `zoneinfo` (`Europe/Berlin`): every DST
+  transition 2020–2040 checked to the second on both sides, plus 400 random
+  instants. All fields match.
+- Reported case reproduced: UTC 12:00 in August → **14** local; January → 13.
+- Regression test for bug 1: on a CIPSTART **timeout**, **zero** `CIPSEND` is
+  issued. On a missing `>` prompt (echo still says OK), the fetch aborts.
+- Re-ran the fetch suite (chunk sizes 1–30, caching, one fetch per 30 ticks) and
+  the date suite. All pass.
+
+## 2026-08-25 (sixth pass) — CIPSTART gets no reply at all
+
+New trace: `AT+PING` succeeds (`+PING:9`, so DNS and internet are fine), then
+`AT+CIPSTART` is echoed and **nothing comes back at all**. Still 0 on many
+attempts. The user confirmed the problem persists with `debugMODE = false`.
+
+### Ruled out
+
+- **Debug logging blocking the UART.** Was a strong hypothesis: `softSerial`
+  bit-bangs at 4800 baud and busy-waits, so logging a ~50-char command blocks
+  ~110 ms, during which ~1150 bytes can arrive at 115200 baud. The user tested
+  with `debugMODE = false` and saw no change, so this is **not** the cause. The
+  mitigations were kept anyway (they are correct regardless) — see below.
+- **Leftover bytes from the previous command.** `clearSerialBuffer()` runs first
+  in `fetchNetDate`, so `AT+PING`'s trailing `OK` is flushed before CIPSTART.
+- **The 20-char "truncation" in the log.** Both long echoes cut at exactly 20
+  chars while short ones (11, 13) arrived whole — that was the logger, not the
+  module.
+
+### Most likely cause: DNS / IPv6 on CIPSTART
+
+`detectportal.firefox.com` resolves to **IPv6 first** (`2a04:4e42:...`, Fastly).
+`AT+PING` succeeded because it falls back to IPv4, but several ESP-AT builds
+stall with **no reply at all** on `CIPSTART` when a name resolves to IPv6 on
+firmware without working IPv6, or when DNS is slow. That matches the trace
+exactly: echo, then silence.
+
+### Fix: shorter primary host + a bare-IP fallback
+
+- Primary is now **`example.com`** (`/`): IANA-reserved, stable, and the AT line
+  drops from 47 to 34 characters.
+- Fallback is **`1.1.1.1`** (`/`) — a bare IPv4 literal, so `CIPSTART` performs
+  **no DNS at all**. Verified it answers plain HTTP on port 80 with a valid
+  `Date:` header (a 301 to HTTPS, which is fine: we only read the header and
+  never follow the redirect).
+- `fetchNetDate(host, path)` is now parameterised and tried twice.
+
+### Kept from the debug investigation (correct regardless)
+
+- **`serial.setRxBufferSize(254)` in `setupWifi`.** The pxt default is 64 bytes
+  (~5.5 ms at 115200). `doApSetup` already did this; **station mode never did**,
+  so any stall before a read could lose a reply. Real latent bug, now fixed.
+- **Debug logging moved out of the hot path.** `sendAtCmd` no longer bit-bangs
+  the echo inline; the command is stashed in `pendingCmd` and printed by
+  `debugLog()` together with the reply, *after* the reply has been read. Also
+  means the log now shows the full command instead of a 20-char stub, and a
+  timeout is labelled `[TIMEOUT]`.
+
+### Verification
+
+Modelled a named host that echoes and then never answers (the exact reported
+symptom): the IP fallback recovers it, two `CIPSTART`s are issued, and the time
+parses. Also: only one `CIPSTART` when the primary works, `0` when both fail, no
+`CIPSEND` when nothing connected, chunk sizes 1–25, caching, and 426 timezone
+points. All pass.
+
+**If it still fails on hardware**, the next data point needed is the trace with
+the new build: whether `AT+CIPSTART="TCP","1.1.1.1",80` also gets no reply. If
+even the bare IP is silent, the problem is below DNS (module state after
+`AT+PING`, or `CWMODE`/DHCP), not name resolution.
+
+## 2026-08-25 (seventh pass) — working; switched GET -> HEAD
+
+User confirmed the bug is gone. The successful trace showed `CONNECT`, `SEND OK`
+and an intact `Date: Tue, 25 Aug 2026 13:05:30 GMT`. Most likely the fix was
+dropping the IPv6-first hostname (`detectportal.firefox.com` → `example.com`);
+the `1.1.1.1` bare-IP fallback remains as backup if DNS misbehaves again.
+
+### GET -> HEAD
+
+The trace showed the reply was `+IPD,867:` — the full chunked HTML page of
+`example.com`, of which only the `Date:` header (first ~40 bytes) is ever used.
+The module had to funnel all of it over the UART and the read loop had to buffer
+it, once per refresh.
+
+`HEAD` returns byte-identical headers with no body. Measured live:
+
+| request | reply size |
+| --- | --- |
+| `GET /` on example.com | 867 B |
+| `HEAD /` on example.com | **269 B** (−69%) |
+| `HEAD /` on 1.1.1.1 | 214 B |
+
+Both hosts honour it (`example.com` even advertises `Allow: GET, HEAD`), and both
+still return `Date:`. Only the time fetch changed — `adafruitIOGetValue` still
+uses GET, as it must (it needs the body).
+
+Verified by feeding a **live** `HEAD` reply (captured over netcat, wrapped in
+`+IPD` framing) through the real parser: 13 UTC → 15 local CEST, 25/8/2026,
+matching the system clock.
+
+### Test-harness bug worth remembering
+
+The first run after this change reported 10 failures. They were all the mock, not
+the driver: the fake module only answered requests starting with `"GET "`, so it
+never replied to a HEAD. Fixed the mock and added assertions that the request line
+**is** HEAD and that no GET is issued. A harness that hardcodes what it expects
+the code to send will "fail" on any correct change to that request.
+
+### Note
+
+User asked that this project never be committed. Nothing has been.
+
+## 2026-08-25 (eighth pass) — 1.1.1.1 is now the primary host
+
+User's call: default to `1.1.1.1` instead of `example.com`.
+
+Worth recording: in the trace accompanying the request, `example.com` **did**
+answer correctly (`+IPD,269:` with `Date: Tue, 25 Aug 2026 13:21:36 GMT`). But the
+user has the field evidence across many attempts, and the IP is the more robust
+default on its own merits — `CIPSTART` to a literal does no DNS at all, and DNS
+was the one part of the path that kept failing.
+
+- `TIME_HOST` = `1.1.1.1` (no DNS)
+- `TIME_HOST2` = `example.com` (fallback, in case a network blocks 1.1.1.1 — some
+  routers and ISPs do, since it is also a public resolver)
+
+### Side effect on "Internet OK?"
+
+It pings `TIME_HOST`, so it now pings an IP. Faster (no lookup), but it no longer
+proves DNS works: a network with dead DNS will report internet OK. That is
+arguably the more honest test of raw reachability, and it now matches what the
+time fetch actually does. Noted in case DNS-awareness is wanted later.
+
+### Verification
+
+Live `HEAD /` against 1.1.1.1 captured over netcat (213 B), wrapped in `+IPD`
+framing, parsed by the real driver functions: **15:23 25/8/2026 local**, matching
+the system clock. Note its `Date:` header comes *after* `Server:`, which the
+line-anchored `findDateHeader` handles correctly.
+
+Suite: primary is the IP and only one CIPSTART is issued; `internetOk` pings the
+IP; falls back to example.com when 1.1.1.1 is blocked; chunk sizes 1–25; caching;
+no CIPSEND when nothing connected. All pass.
+
+## 2026-08-25 (ninth pass) — hosts swapped back; refresh window 10 min -> 30 s
+
+Two user requests.
+
+### 1. `example.com` is the primary again
+
+Reverted the previous swap. `TIME_HOST` = `example.com`, `TIME_HOST2` = `1.1.1.1`.
+
+Context from the same conversation: the user asked why the reply said
+`Server: cloudflare`. Answer — `example.com` is genuinely served through
+Cloudflare (it resolves to `104.20.23.154` / `172.66.147.243`, Cloudflare ranges),
+so that header is expected and is *not* evidence of interception. The `CF-RAY`
+suffix names the edge that answered (`-CDG` Paris, `-TXL` Berlin); different
+requests hitting different edges is normal CDN behaviour.
+
+Both defaults are therefore Cloudflare-fronted, so a Cloudflare-wide outage takes
+out both. `deb.debian.org` (Fastly) was offered as a genuinely independent
+fallback; the user did not take it. Noted in case it matters later.
+
+### 2. "The internet time block should always refresh"
+
+Implemented as a **30 s** cache rather than a literal fetch-per-call, after
+laying out the cost:
+
+- one fetch blocks **~1.4 s** on success, and up to **~50 s** if both hosts are
+  unreachable (25 s worst case per host);
+- `internetTime(Hour)` followed by `internetTime(Minute)` would be **two** fetches
+  — ~3 s of blocking, and the two values can disagree if a minute rolls over in
+  between.
+
+The user chose the 30 s window. `TIME_REFRESH_MS` 600000 → 30000.
+
+Verified: hour+minute back-to-back share one fetch (one consistent instant); a
+re-fetch happens once the cache passes 30 s; no fetch within 30 s; a 1 s loop over
+30 ticks performs ≤2 fetches rather than 30. Host order, chunked parsing and the
+failure paths all still pass.
