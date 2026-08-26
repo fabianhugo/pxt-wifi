@@ -1232,13 +1232,13 @@ namespace WiFi {
 
         // Short, memorable AP address (default would be 192.168.4.1). Volatile
         // (SYSSTORE=0), so re-applied on every setup / reboot recovery.
-        sendAtCmd("AT+CIPAP=\"4.3.2.1\",\"4.3.2.1\",\"255.255.255.0\"")
+        sendAtCmd("AT+CIPAP=\"10.0.0.1\",\"10.0.0.1\",\"255.255.255.0\"")
         waitAtResponse("OK", "ERROR", "None", 2000)
 
         // Advertise the dashboard as "calliope.local" via mDNS, so devices that
         // resolve .local names (iOS/macOS, Windows) can use the name instead of
         // the IP. Harmless if the firmware lacks mDNS -- it just answers ERROR and
-        // we ignore it; 4.3.2.1 stays the reliable fallback (Android often can't
+        // we ignore it; 10.0.0.1 stays the reliable fallback (Android often can't
         // resolve .local). Must run after the SoftAP IP is set.
         sendAtCmd("AT+MDNS=1,\"calliope\",\"_http\",80")
         waitAtResponse("OK", "ERROR", "None", 1000)

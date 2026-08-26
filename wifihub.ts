@@ -99,7 +99,7 @@ namespace WiFiHub {
 
     // ---- node side (a mini that PUSHES to the hub) ----
     let joined = false             // did joinHub() succeed?
-    let hubHost = "4.3.2.1"        // matches the CIPAP address the hub sets
+    let hubHost = "10.0.0.1"        // matches the CIPAP address the hub sets
     // Where the last push got to: 0 ok, 1 no connection, 2 no send prompt,
     // 3 sent but not acknowledged.
     let pushStage = 0
@@ -236,7 +236,7 @@ namespace WiFiHub {
      * changed from the default.
      */
     //% block="hub address %host"
-    //% host.defl="4.3.2.1"
+    //% host.defl="10.0.0.1"
     //% group="Node"
     //% weight=68
     //% advanced=true
@@ -461,7 +461,7 @@ namespace WiFiHub {
         }
 
         // Short, memorable address. Nodes default to this (WiFi.setHubAddress).
-        sendAtCmd("AT+CIPAP=\"4.3.2.1\",\"4.3.2.1\",\"255.255.255.0\"")
+        sendAtCmd("AT+CIPAP=\"10.0.0.1\",\"10.0.0.1\",\"255.255.255.0\"")
         waitAtResponse("OK", "ERROR", "None", 2000)
 
         sendAtCmd("AT+CIPMUX=1")            // required for a TCP server
@@ -482,7 +482,7 @@ namespace WiFiHub {
         }
 
         lastRequestTime = input.runningTime()
-        debugNote(apReady ? "hub up: " + hubSsid + " on 4.3.2.1"
+        debugNote(apReady ? "hub up: " + hubSsid + " on 10.0.0.1"
                           : "hub FAILED to start (CWSAP never accepted)")
     }
 
