@@ -169,3 +169,46 @@ The remaining real caveat is Android, which does not resolve `.local` regardless
 **Lesson for these notes:** "command returned ERROR" is not the same as "feature
 unsupported". I asserted the stronger claim from the weaker evidence, and the
 source was available locally the whole time to check.
+
+## 2026-08-25 — does calliope.local work in AP mode?
+
+Checked the esp-at source rather than inferring this time.
+
+**The command is mode-agnostic.** Nothing in `AT+MDNS`'s spec
+(`docs/en/AT_Command_Set/TCP-IP_AT_Commands.rst:2559+`) or in `main/Kconfig`
+restricts it to station mode, so the module does advertise `calliope.local` on
+its SoftAP. With the `AT+MDNS=0` reset added earlier it should now answer OK in
+both paths.
+
+**Whether it RESOLVES is a client question, and AP mode is the harder case:**
+
+| client | station mode | AP mode |
+| --- | --- | --- |
+| macOS / iOS | yes (Bonjour) | usually |
+| Windows | yes | usually |
+| Android | **no** | **no** |
+
+Two things make AP mode weaker, neither of them firmware:
+
+- Android does not resolve `.local` at all, in either mode.
+- On a network with no internet, phones often keep mobile data as the default
+  route and never send the mDNS query to the Calliope's network.
+
+Worth noting the official example (`TCP-IP_AT_Examples.rst:1869`) demonstrates
+mDNS in **station mode** only — it is not evidence against AP mode, but it is
+what the vendor exercises.
+
+So: the name is worth advertising in AP mode, and `10.0.0.1` remains the answer
+that always works.
+
+Tidy-ups while here:
+
+- The AP comment no longer claims the firmware might lack mDNS (that was the
+  incorrect inference corrected above); it now separates "the module announces
+  the name" from "the client resolves it".
+- **`WiFi IP address` now works in AP mode too**, returning the access point
+  address instead of an empty string. Previously it was only populated by
+  station mode, which made it useless in exactly the mode where a user is most
+  likely to need a number to type.
+- The AP address is now a single `AP_IP` constant used by both `AT+CIPAP` and
+  `wifiIpAddress()`, so the pinned address and the reported one cannot drift.

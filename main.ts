@@ -1137,6 +1137,9 @@ namespace WiFi {
     let serverStationMode = false
     let staIp = ""                 // our address on the joined network
     let mdnsOk = false             // did AT+MDNS actually work on this firmware?
+    // The fixed address of our own access point. Defined once: doApSetup pins it
+    // with AT+CIPAP and wifiIpAddress() reports it, and those must not drift.
+    const AP_IP = "10.0.0.1"
     // Dashboard controls the user sets in the browser, exposed as MakeCode blocks.
     let ctrlToggle = [false, false, false]   // A, B, C
     let ctrlSlider = [0, 0, 0]               // A, B, C (0-100)
@@ -1227,14 +1230,17 @@ namespace WiFi {
     }
 
     /**
-     * The address the dashboard is reachable at on the joined network, e.g.
-     * "192.168.1.42". Empty until "serve dashboard on WiFi" has run. Useful on
-     * Android, which cannot resolve "calliope.local".
+     * The address the dashboard is reachable at: the router-assigned address in
+     * station mode, or the fixed access point address. Show this on the display
+     * for Android, which cannot resolve "calliope.local".
      */
     //% block="WiFi IP address"
     //% group="Access Point"
     //% weight=68
     export function wifiIpAddress(): string {
+        // In AP mode the address is the one doApSetup pins with AT+CIPAP, so it
+        // is known without asking the module.
+        if (!serverStationMode) return AP_IP
         return staIp
     }
 
@@ -1390,14 +1396,16 @@ namespace WiFi {
 
         // Short, memorable AP address (default would be 192.168.4.1). Volatile
         // (SYSSTORE=0), so re-applied on every setup / reboot recovery.
-        sendAtCmd("AT+CIPAP=\"10.0.0.1\",\"10.0.0.1\",\"255.255.255.0\"")
+        sendAtCmd("AT+CIPAP=\"" + AP_IP + "\",\"" + AP_IP + "\",\"255.255.255.0\"")
         waitAtResponse("OK", "ERROR", "None", 2000)
 
-        // Advertise the dashboard as "calliope.local" via mDNS, so devices that
-        // resolve .local names (iOS/macOS, Windows) can use the name instead of
-        // the IP. Harmless if the firmware lacks mDNS -- it just answers ERROR and
-        // we ignore it; 10.0.0.1 stays the reliable fallback (Android often can't
-        // resolve .local). Must run after the SoftAP IP is set.
+        // Advertise the dashboard as "calliope.local" via mDNS. The AT command is
+        // mode-agnostic -- nothing restricts it to station mode -- so the name is
+        // announced on the SoftAP too. Whether a client RESOLVES it is a separate
+        // matter: macOS/iOS/Windows generally do, Android does not resolve .local
+        // at all, and phones may also keep mobile data as the default route on a
+        // network with no internet and never send the query here. 10.0.0.1 stays
+        // the answer that always works. Must run after the SoftAP IP is set.
         // Reset first: AT+MDNS=1 is refused with ERROR if mDNS is ALREADY
         // running (this setup having run before, or the reboot self-heal
         // re-running it). That error is easy to misread as "this firmware has
