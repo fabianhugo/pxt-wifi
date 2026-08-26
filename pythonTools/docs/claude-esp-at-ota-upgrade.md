@@ -649,3 +649,48 @@ Since rollback is *always* a downgrade, and the notes above call `AT+RESTORE`
 protection that matters most there. `restoreFirmware()` already mirrors
 `do_rollback()` exactly — `AT+SYSROLLBACK` → 8 s → `AT+RESTORE` → 6 s, no
 `AT+RST` — and is left unchanged. Decision confirmed with the user.
+
+### 2026-08-25 — Endless ">>AT / [TIMEOUT]" after hot-plugging the module
+
+Symptom: rarely, when the WiFi board is connected to an **already-powered**
+Calliope, `setupWifi` loops forever printing `>>AT` / `<< [TIMEOUT]`. Pressing
+reset on the mini does **not** help; only repowering the module does.
+
+**The user's guess was right: it is the boot race, and it crashes the module.**
+This is esp-at commit `371b9fc4`, already listed at line ~90 of these notes:
+*"crash if AT command arrives before AT is ready (classic host-MCU boot race)"*.
+
+Two details make the diagnosis fit exactly:
+
+- It is a **crash**, not a dropped command. A merely-slow module would answer on
+  a later retry; a crashed one answers nothing, so the 20 s retry loop spins to
+  no purpose.
+- Resetting the **mini** cannot fix it. The mini reboots and starts probing
+  again; the *module* is still crashed and still silent. Only module power does
+  it — which matches the report precisely.
+
+**And it is now more likely, not less:** `371b9fc4` is among the ~350 commits
+between v3.3.0.0 and v4.1.x, so the fix is **absent** from the 3.3.0.0 the device
+was just downgraded to. Worth stating plainly: staying on 4.2.0.0 would avoid
+this failure mode; the downgrade re-introduced it.
+
+**Mitigations added to `setupWifi` (helpful on any firmware version):**
+
+1. **Wait before speaking.** Up to 1.5 s listening for the module's `ready`
+   banner *before* the first `AT`, breaking the race instead of losing it. Capped,
+   because a module that booted long ago will never print `ready` again — that
+   path just falls through.
+2. **`AT+RST` when it stays silent**, at retry 6 and again at 20. A reset is
+   harmless if the module is merely slow and revives it if it is wedged, so the
+   loop stops spending its whole 20 s budget on a module that will never answer.
+
+Verified against a mocked module: healthy module needs no `AT+RST` and completes
+in ≤2 probes; a wedged module that `AT+RST` revives recovers and continues within
+the budget; a module that never returns is given up on after exactly two resets
+in bounded time; the boot banner is consumed rather than mistaken for a reply.
+
+**Unrelated trap noticed while reading `setupWifi`:** the block declares
+`//% baudRate.defl=BaudRate.BaudRate9600`, but the code redirects at 115200 and
+only reconfigures the module when the argument is *not* 115200. A user who leaves
+the default gets a mismatch. Not the cause of this bug (the user passes 115200
+explicitly) and not changed, but it should probably be `defl=BaudRate115200`.

@@ -1132,6 +1132,11 @@ namespace WiFi {
     let apSsid = ""
     let apPasswd = ""
     let apReady = false            // did the last setup actually bring the AP up?
+    // The web server can run in two modes: as its own access point, or joined to
+    // an existing network. The reboot self-heal has to restore the right one.
+    let serverStationMode = false
+    let staIp = ""                 // our address on the joined network
+    let mdnsOk = false             // did AT+MDNS actually work on this firmware?
     // Dashboard controls the user sets in the browser, exposed as MakeCode blocks.
     let ctrlToggle = [false, false, false]   // A, B, C
     let ctrlSlider = [0, 0, 0]               // A, B, C (0-100)
@@ -1160,6 +1165,7 @@ namespace WiFi {
     //% ssid.defl="CalliopeHub"
     //% weight=80
     export function startAccessPoint(txPin: SerialPin, rxPin: SerialPin, baudRate: BaudRate, ssid: string, passwd: string) {
+        serverStationMode = false
         // Remember the config so the background loop can re-run setup after a
         // module reboot (config isn't persisted -- AT+SYSSTORE=0).
         apTxPin = txPin
@@ -1174,6 +1180,158 @@ namespace WiFi {
 
         doApSetup()
         startBackgroundServer()
+    }
+
+    /**
+     * Serve the dashboard on a WiFi network that already exists, instead of
+     * making one. Joins the network, then starts the same web server.
+     *
+     * The router decides our address, so the page is announced as
+     * "calliope.local" via mDNS -- that works on iOS, macOS and Windows.
+     * Android usually cannot resolve .local names; use "WiFi IP address" to read
+     * the numeric address and type that instead.
+     *
+     * Use this OR "start access point", not both.
+     */
+    //% block="serve dashboard on WiFi|TX %txPin|RX %rxPin|Baud rate %baudRate|SSID = %ssid|Password = %passwd"
+    //% txPin.defl=SerialPin.C17
+    //% rxPin.defl=SerialPin.C16
+    //% baudRate.defl=BaudRate.BaudRate115200
+    //% group="Access Point"
+    //% weight=69
+    export function startWebServerOnWifi(txPin: SerialPin, rxPin: SerialPin, baudRate: BaudRate, ssid: string, passwd: string) {
+        apTxPin = txPin
+        apRxPin = rxPin
+        apBaud = baudRate
+        apSsid = ssid
+        apPasswd = passwd
+        serverStationMode = true
+
+        datalogger.onLogFull(function () { logFull = true })
+
+        doStationSetup()
+        startBackgroundServer()
+    }
+
+    /**
+     * True if the module accepted the "calliope.local" name. If false the name
+     * will not resolve, so use "WiFi IP address" instead. Android cannot resolve
+     * .local names even when this is true.
+     */
+    //% block="calliope.local available?"
+    //% group="Access Point"
+    //% weight=67
+    //% advanced=true
+    export function mdnsAvailable(): boolean {
+        return mdnsOk
+    }
+
+    /**
+     * The address the dashboard is reachable at on the joined network, e.g.
+     * "192.168.1.42". Empty until "serve dashboard on WiFi" has run. Useful on
+     * Android, which cannot resolve "calliope.local".
+     */
+    //% block="WiFi IP address"
+    //% group="Access Point"
+    //% weight=68
+    export function wifiIpAddress(): string {
+        return staIp
+    }
+
+    // Join an existing network and start the same web server on it. Also used to
+    // recover after a module reboot (config isn't persisted -- AT+SYSSTORE=0).
+    function doStationSetup() {
+        serial.redirect(apTxPin, apRxPin, BaudRate.BaudRate115200)
+        serial.setRxBufferSize(254)
+
+        // The module may still be booting; anything sent now would be lost.
+        let ready = false
+        for (let i = 0; i < 40 && !ready; i++) {
+            sendAtCmd("AT")
+            if (waitAtResponse("OK", "ERROR", "None", 300) == 1) ready = true
+            else basic.pause(200)
+        }
+
+        sendAtCmd("AT+SYSSTORE=0")
+        waitAtResponse("OK", "ERROR", "FAIL", 3000)
+
+        let baudNum = apBaud as number
+        if (baudNum != 115200) {
+            sendAtCmd("AT+UART_CUR=" + baudNum + ",8,1,0,0")
+            basic.pause(100)
+            serial.redirect(apTxPin, apRxPin, apBaud)
+            basic.pause(100)
+            sendAtCmd("AT")
+            waitAtResponse("OK", "ERROR", "None", 1000)
+        }
+
+        sendAtCmd("AT+CWMODE=1")             // station
+        waitAtResponse("OK", "ERROR", "None", 1000)
+
+        // Join, retried -- the first attempt can fail right after boot.
+        apReady = false
+        for (let attempt = 0; attempt < 3 && !apReady; attempt++) {
+            sendAtCmd("AT+CWJAP=\"" + apSsid + "\",\"" + apPasswd + "\"")
+            if (waitAtResponse("WIFI GOT IP", "ERROR", "None", 20000) == 1) apReady = true
+            else basic.pause(500)
+        }
+        isWifiConnected = apReady
+
+        // Read back the address the router gave us, so it can be shown on the
+        // display. The reply looks like: +CIPSTA:ip:"192.168.1.42"
+        staIp = ""
+        sendAtCmd("AT+CIPSTA?")
+        let buf = ""
+        let start = input.runningTime()
+        while ((input.runningTime() - start) < 2000) {
+            buf += serial.readString()
+            if (buf.includes("OK") || buf.includes("ERROR")) break
+            basic.pause(50)
+        }
+        let key = "+CIPSTA:ip:\""
+        let i = buf.indexOf(key)
+        if (i < 0) { key = "+CIPSTA_CUR:ip:\""; i = buf.indexOf(key) }
+        if (i >= 0) {
+            let j = buf.indexOf("\"", i + key.length)
+            if (j > 0) staIp = buf.substr(i + key.length, j - i - key.length)
+        }
+
+        // Announce the dashboard as "calliope.local".
+        // Reset first: AT+MDNS=1 is refused with ERROR if mDNS is ALREADY
+        // running (this setup having run before, or the reboot self-heal
+        // re-running it). That error is easy to misread as "this firmware has
+        // no mDNS" -- it does: CONFIG_AT_MDNS_COMMAND_SUPPORT defaults to y and
+        // module_esp32c3_default does not disable it.
+        sendAtCmd("AT+MDNS=0")
+        waitAtResponse("OK", "ERROR", "None", 1000)
+        sendAtCmd("AT+MDNS=1,\"calliope\",\"_http\",80")
+        mdnsOk = waitAtResponse("OK", "ERROR", "None", 1000) == 1
+
+        // Shut down any server left over from a previous run BEFORE configuring.
+        // Config is volatile (SYSSTORE=0) but a running server is not cleared by
+        // it, and AT+CIPSERVERMAXCONN is rejected while a server exists -- which
+        // is exactly the ERROR seen on hardware here.
+        sendAtCmd("AT+CIPSERVER=0")
+        waitAtResponse("OK", "ERROR", "None", 1000)
+
+        sendAtCmd("AT+CIPMUX=1")             // required for a TCP server
+        waitAtResponse("OK", "ERROR", "None", 1000)
+
+        sendAtCmd("AT+CIPSTO=10")
+        waitAtResponse("OK", "ERROR", "None", 1000)
+
+        // Must precede AT+CIPSERVER. If it still errors the server simply runs
+        // with the firmware default, which is workable for one browser.
+        sendAtCmd("AT+CIPSERVERMAXCONN=5")
+        waitAtResponse("OK", "ERROR", "None", 1000)
+
+        for (let attempt = 0; attempt < 3; attempt++) {
+            sendAtCmd("AT+CIPSERVER=1,80")
+            if (waitAtResponse("OK", "ERROR", "None", 1000) != 0) break
+            basic.pause(300)
+        }
+
+        lastRequestTime = input.runningTime()
     }
 
     // Send the AP + web-server AT commands (also used to recover after a reboot).
@@ -1240,7 +1398,19 @@ namespace WiFi {
         // the IP. Harmless if the firmware lacks mDNS -- it just answers ERROR and
         // we ignore it; 10.0.0.1 stays the reliable fallback (Android often can't
         // resolve .local). Must run after the SoftAP IP is set.
+        // Reset first: AT+MDNS=1 is refused with ERROR if mDNS is ALREADY
+        // running (this setup having run before, or the reboot self-heal
+        // re-running it). That error is easy to misread as "this firmware has
+        // no mDNS" -- it does: CONFIG_AT_MDNS_COMMAND_SUPPORT defaults to y and
+        // module_esp32c3_default does not disable it.
+        sendAtCmd("AT+MDNS=0")
+        waitAtResponse("OK", "ERROR", "None", 1000)
         sendAtCmd("AT+MDNS=1,\"calliope\",\"_http\",80")
+        mdnsOk = waitAtResponse("OK", "ERROR", "None", 1000) == 1
+
+        // Clear any server left running from a previous run: AT+CIPSERVERMAXCONN
+        // below is rejected while one exists, and SYSSTORE=0 does not clear it.
+        sendAtCmd("AT+CIPSERVER=0")
         waitAtResponse("OK", "ERROR", "None", 1000)
 
         // Multiple connections are required for a TCP server.
@@ -1365,7 +1535,8 @@ namespace WiFi {
         if (rxBuf.indexOf("ready") >= 0) {
             rxBuf = ""
             basic.pause(500)
-            doApSetup()
+            if (serverStationMode) doStationSetup()
+            else doApSetup()
             return
         }
 
@@ -1587,7 +1758,7 @@ namespace WiFi {
                 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
                 "<title>Calliope mini WLAN-Log</title><style>" +
                 "body{font-family:\"Roboto\",\"Helvetica Now\",Helvetica,Arial,sans-serif;margin:0;color:#222}" +
-                ".header-strip{height:10px;background:rgba(66,201,201,1)}" +
+                ".header-strip{height:10px;background:#42c9c9}" +
                 ".header-contents{padding:0 1em}" +
                 "h1{display:block;font-size:2em;margin:.67em 0;font-weight:bold;unicode-bidi:isolate}" +
                 "main{margin:1em}" +
@@ -1602,7 +1773,7 @@ namespace WiFi {
                 "#full{display:none;color:#c00;font-weight:700;font-size:13px;margin:.3em 0}" +
                 "#charts{display:flex;flex-wrap:wrap;gap:1em;margin-top:1em}" +
                 ".chart{border:1px solid #eee;border-radius:6px;width:420px;max-width:100%}" +
-                "button{cursor:pointer;border-radius:23px;min-height:40px;font-weight:700;font-size:14px;padding:0 18px;border:none;background:rgba(66,201,201,1);color:#fff;margin:.5em 0}" +
+                "button{cursor:pointer;border-radius:23px;min-height:40px;font-weight:700;font-size:14px;padding:0 18px;border:none;background:#42c9c9;color:#fff;margin:.5em 0}" +
                 ".top{display:flex;flex-wrap:wrap;gap:1em;align-items:flex-start}" +
                 ".card{border:1px solid #ddd;border-radius:8px;padding:.6em 1em .9em;background:#fafafa}" +
                 ".tablebox{flex:0 0 auto;width:280px;max-width:100%}" +
@@ -1613,14 +1784,7 @@ namespace WiFi {
                 "#ctrls .lbl{width:5em}" +
                 "#ctrls input[type=range]{flex:1;min-width:90px}" +
                 "#ctrls .val{width:2.5em;text-align:right;font-variant-numeric:tabular-nums}" +
-                ".switch{position:relative;display:inline-block;width:64px;height:28px;flex:none}" +
-                ".switch input{opacity:0;width:0;height:0}" +
-                ".switch .slider{position:absolute;inset:0;cursor:pointer;background:#bbb;border-radius:28px;transition:.2s}" +
-                ".switch .slider:before{content:\"\";position:absolute;height:22px;width:22px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.3)}" +
-                ".switch .slider:after{content:\"AUS\";position:absolute;right:7px;top:7px;font-size:10px;font-weight:700;color:#fff}" +
-                ".switch input:checked + .slider{background:rgba(66,201,201,1)}" +
-                ".switch input:checked + .slider:before{transform:translateX(36px)}" +
-                ".switch input:checked + .slider:after{content:\"EIN\";left:8px;right:auto}" +
+                "#ctrls input[type=checkbox]{width:38px;height:22px;accent-color:#42c9c9;cursor:pointer}" +
                 "footer{margin:1em;color:#888;font-size:13px}" +
                 "</style></head><body>" +
                 "<header><div class=\"header-strip\"></div>" +
@@ -1634,9 +1798,9 @@ namespace WiFi {
                 "<button onclick=\"dlCsv()\">Als CSV herunterladen</button>" +
                 "</div>" +
                 "<section id=\"ctrls\" class=\"card\"><h2>Steuerung</h2>" +
-                "<div class=\"row\"><span class=\"lbl\">Schalter A</span><label class=\"switch\"><input type=\"checkbox\" id=\"tA\"><span class=\"slider\"></span></label></div>" +
-                "<div class=\"row\"><span class=\"lbl\">Schalter B</span><label class=\"switch\"><input type=\"checkbox\" id=\"tB\"><span class=\"slider\"></span></label></div>" +
-                "<div class=\"row\"><span class=\"lbl\">Schalter C</span><label class=\"switch\"><input type=\"checkbox\" id=\"tC\"><span class=\"slider\"></span></label></div>" +
+                "<div class=\"row\"><span class=\"lbl\">Schalter A</span><input type=\"checkbox\" id=\"tA\"></div>" +
+                "<div class=\"row\"><span class=\"lbl\">Schalter B</span><input type=\"checkbox\" id=\"tB\"></div>" +
+                "<div class=\"row\"><span class=\"lbl\">Schalter C</span><input type=\"checkbox\" id=\"tC\"></div>" +
                 "<div class=\"row\"><span class=\"lbl\">Regler A</span><input type=\"range\" min=\"0\" max=\"100\" value=\"0\" id=\"sA\"><span id=\"sAv\" class=\"val\">0</span></div>" +
                 "<div class=\"row\"><span class=\"lbl\">Regler B</span><input type=\"range\" min=\"0\" max=\"100\" value=\"0\" id=\"sB\"><span id=\"sBv\" class=\"val\">0</span></div>" +
                 "<div class=\"row\"><span class=\"lbl\">Regler C</span><input type=\"range\" min=\"0\" max=\"100\" value=\"0\" id=\"sC\"><span id=\"sCv\" class=\"val\">0</span></div>" +
@@ -1645,9 +1809,9 @@ namespace WiFi {
                 "<div id=\"status\">warte auf Daten...</div></main>" +
                 "<footer>Aktualisiert sich alle 2&nbsp;s &middot; live vom WLAN-Modul</footer>" +
                 "<script>" +
-                "var s=document.getElementById('status'),tbl=document.getElementById('t')," +
-                "lu=document.getElementById('last'),charts=document.getElementById('charts')," +
-                "full=document.getElementById('full'),pk=document.getElementById('pkts');" +
+                "function E(i){return document.getElementById(i)}" +
+                "var s=E('status'),tbl=E('t'),lu=E('last'),charts=E('charts')," +
+                "full=E('full'),pk=E('pkts');" +
                 "var cols=[],rowEls=[],rows=[],offset=-1;" +
                 "var inflight=false,ctrlReady=false,downloading=false;" +
                 "function build(h){cols=h;for(var ci=0;ci<h.length;ci++){" +
@@ -1685,7 +1849,7 @@ namespace WiFi {
                 "s+='<line x1=\"'+pl+'\" y1=\"'+yy+'\" x2=\"'+(pl+gw)+'\" y2=\"'+yy+'\" stroke=\"#eee\"/>';" +
                 "s+='<text x=\"2\" y=\"'+(+yy+3)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"10\">'+yl[j].toFixed(1)+'</text>';}" +
                 "var p='';for(i=0;i<a.length;i++)p+=xf(i)+','+yf(a[i])+' ';" +
-                "s+='<polyline fill=\"none\" stroke=\"rgba(66,201,201,1)\" stroke-width=\"2\" points=\"'+p+'\"/>';" +
+                "s+='<polyline fill=\"none\" stroke=\"#42c9c9\" stroke-width=\"2\" points=\"'+p+'\"/>';" +
                 "var tk=4;for(i=0;i<=tk;i++){var f=i/tk,xx=(pl+f*gw).toFixed(1),ago=Math.round((1-f)*(a.length-1)*2);" +
                 "s+='<line x1=\"'+xx+'\" y1=\"'+(pt+gh)+'\" x2=\"'+xx+'\" y2=\"'+(pt+gh+3)+'\" stroke=\"#ccc\"/>';" +
                 "s+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}" +
@@ -1701,7 +1865,7 @@ namespace WiFi {
                 "var rc=parseInt(resp.headers.get('X-Row-Count')||'-1');" +
                 // Row count went backwards -> the device restarted/reset its log.
                 // Our buffered rows are now stale; drop them and reseed next poll.
-                "if(rc>=0&&offset>=0&&rc<offset){console.log('reset: Neustart erkannt rc='+rc+' offset='+offset);rows.length=0;offset=-1;return;}" +
+                "if(rc>=0&&offset>=0&&rc<offset){console.log('reset',rc,offset);rows.length=0;offset=-1;return;}" +
                 "var t=await resp.text();" +
                 "var L=t.replace(/\\r/g,'').split('\\n'),nr=[],li;" +
                 "for(li=0;li<L.length;li++)if(L[li].length)nr.push(L[li].split(','));" +
@@ -1709,7 +1873,6 @@ namespace WiFi {
                 "if(!cols.length&&nr.length)build(nr[0]);" +
                 "for(var ri=1;ri<nr.length;ri++)rows.push(nr[ri]);" +
                 "if(rows.length>500)rows.splice(0,rows.length-500);" +
-                "console.log('poll: X-Row-Count='+rc+' neueZeilen='+(nr.length>0?nr.length-1:0)+' offset='+offset+' puffer='+rows.length);" +
                 "if(!rows.length){s.textContent='(warte auf Daten...)';return;}" +
                 "var d=rows.slice(-100),last=d[d.length-1],ci;" +
                 "for(ci=0;ci<cols.length;ci++){if(!rowEls[ci])continue;" +
@@ -1720,9 +1883,8 @@ namespace WiFi {
                 "s.textContent='aktualisiert';" +
                 "}catch(e){s.textContent='(warte auf Daten...)';}" +
                 "finally{clearTimeout(tmo);inflight=false;}}" +
-                "var elT=[document.getElementById('tA'),document.getElementById('tB'),document.getElementById('tC')];" +
-                "var elS=[document.getElementById('sA'),document.getElementById('sB'),document.getElementById('sC')];" +
-                "var elSv=[document.getElementById('sAv'),document.getElementById('sBv'),document.getElementById('sCv')];" +
+                "var elT=[E('tA'),E('tB'),E('tC')],elS=[E('sA'),E('sB'),E('sC')]," +
+                "elSv=[E('sAv'),E('sBv'),E('sCv')];" +
                 // Controls ride along on the next /data poll (no separate request,
                 // so no collision with polling). Flipping a control triggers an
                 // immediate tick() for snappy response; the inflight guard keeps
