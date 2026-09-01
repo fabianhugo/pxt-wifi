@@ -1,6 +1,11 @@
 /**
- * WiFi Live - a hub that shows the CURRENT readings of several minis on a web
- * page. No charts, no history, no log parsing, no controls.
+ * WiFi Live - a hub that collects readings from several minis and serves them
+ * as a full dashboard: live table, per-sensor charts, CSV download and the
+ * toggle/slider controls.
+ *
+ * This started as a values-only page (~1.6 KB, no flash reads). The charting
+ * dashboard is back by request now that the transfer path is fixed; /live and
+ * the values-only body are still served, so a minimal client can use them.
  *
  * WHY THIS EXISTS
  *
@@ -19,8 +24,13 @@
  * it is independent of what the page shows.
  *
  * HUB PROGRAM (one board)
+ *   datalogger.setColumnTitles("node", "temp", "licht")   // REQUIRED for charts
  *   WiFiLive.startLiveHub(SerialPin.C17, SerialPin.C16, "CalliopeHub", "")
  *   // then open http://10.0.0.1 on a phone joined to that network
+ *
+ * The column titles matter: the charts and the CSV are read back OUT of the
+ * flash log, so the titles must include "node" plus the sensor names the nodes
+ * send. Without them the table and plots come up empty.
  *
  * NODE PROGRAM (each other board)
  *   WiFiLive.joinHub(SerialPin.C17, SerialPin.C16, "CalliopeHub", "")
@@ -75,9 +85,25 @@ namespace WiFiLive {
     let nodeSeen: number[] = []          // runningTime() of the last push
     let pushCount = 0
 
-    // Optional: also write each push to flash for later USB download. Off by
-    // default -- the page does not need it, and it is the slow part.
-    let logToFlash = false
+    // Write each push to flash. ON by default here: the dashboard's charts and
+    // CSV download are read back OUT of the log, so switching this off leaves
+    // the plots empty. (In the values-only build this defaulted to off.)
+    let logToFlash = true
+
+    // ---- dashboard state (charts / history / CSV) ----
+    const CHUNK = 1024               // max bytes per AT+CIPSEND packet
+    const SEED_ROWS = 50             // rows sent on a client's first poll
+    const MAX_ROWS_PER_POLL = 50     // cap so a late client catches up gradually
+    let pageSegs: string[] = []
+    let logFull = false              // set by datalogger.onLogFull -> page banner
+    let lastRowCount = 0             // client's new cursor -> X-Row-Count
+    let lastTotalRows = 0            // device total -> X-Total-Rows
+    let ctrlToggle = [false, false, false]
+    let ctrlSlider = [0, 0, 0]
+    // Wall-clock sync: the browser piggybacks its Unix time on every /data poll.
+    let syncedEpochSec = 0
+    let syncedDeviceMs = 0
+    let timeSynced = false
 
     // ---- node side ----
     let joined = false
@@ -465,12 +491,25 @@ namespace WiFiLive {
     }
 
     function serveRequest(linkId: string, path: string) {
-        if (path.indexOf("/p") == 0) {
+        // NOTE ordering: "/p" is tested before "/push" would be, and "/live"
+        // before the catch-all. Nodes still POST to /p, so they do NOT need
+        // reflashing when switching between the values-only and dashboard builds.
+        if (path.indexOf("/p?") == 0 || path == "/p") {
             // A node pushed readings. Nodes never read the reply -- they close
             // as soon as their own module reports SEND OK -- so do not send one.
             ingest(path)
         } else if (path.indexOf("/live") == 0) {
             serveText(linkId, liveBody())
+        } else if (path.indexOf("/controls") == 0) {
+            serveResponse(linkId, httpResponse("200 OK", "application/json", controlsJson()))
+        } else if (path.indexOf("/log.csv") == 0) {
+            serveLogCsv(linkId)
+        } else if (path.indexOf("/data") == 0) {
+            // The poll carries the browser clock (t=) and the control values,
+            // so only one request type is ever in flight.
+            syncTimeFromQuery(path)
+            applyControls(path)
+            serveResponse(linkId, httpDataResponse(logRowsCsv(parseQueryInt(path, "from"))))
         } else if (path.indexOf("/favicon") == 0) {
             serveText(linkId, "")
         } else {
@@ -549,40 +588,28 @@ namespace WiFiLive {
         }
     }
 
-    // The page is sent as small pieces and never assembled into one string, so
-    // no single large allocation is ever needed (error 022).
     function servePage(linkId: string) {
-        let segs = pageSegments()
-        let total = 0
-        for (let i = 0; i < segs.length; i++) total += segs[i].length
-
+        buildPage()
+        let len = 0
+        for (let i = 0; i < pageSegs.length; i++) len += pageSegs[i].length
         let head = "HTTP/1.1 200 OK\r\n" +
             "Content-Type: text/html; charset=utf-8\r\n" +
-            "Content-Length: " + total + "\r\n" +
+            "Content-Length: " + len + "\r\n" +
             "Cache-Control: no-cache\r\n" +
-            "Connection: close\r\n\r\n"
-        // Pack the segments into a few ~512 B packets instead of sending all 35
-        // individually. Every CIPSEND is a round trip during which node pushes
-        // keep arriving, so 35 of them stretched one page load long enough that
-        // the phone gave up ("warte auf Daten"). Four packets is ~9x less
-        // exposure. The pieces are still small enough that no single large
-        // allocation is needed.
+            "X-Log-Full: " + (logFull ? "1" : "0") + "\r\n" +
+            "Connection: keep-alive\r\n\r\n"
         if (!sendChunk(linkId, head)) return
-        let packet = ""
-        for (let i = 0; i < segs.length; i++) {
-            if (packet.length > 0 && packet.length + segs[i].length > 512) {
-                if (!sendChunk(linkId, packet)) return
-                packet = ""
-                basic.pause(20)              // breather so we don't overrun
+        // Pack the small segments into <=CHUNK packets; never one big string.
+        let buf = ""
+        for (let i = 0; i < pageSegs.length; i++) {
+            if (buf.length + pageSegs[i].length > CHUNK && buf.length > 0) {
+                if (!sendChunk(linkId, buf)) return
+                buf = ""
+                basic.pause(20)
             }
-            packet += segs[i]
+            buf += pageSegs[i]
         }
-        if (packet.length > 0 && !sendChunk(linkId, packet)) return
-        // As in serveText: skip the close if the browser already hung up.
-        if (!peerClosed) {
-            sendAtCmd("AT+CIPCLOSE=" + linkId)
-            waitAt("OK", "ERROR", "CLOSED", 500)
-        }
+        if (buf.length > 0) sendChunk(linkId, buf)
     }
 
     function sendChunk(linkId: string, piece: string): boolean {
@@ -635,46 +662,376 @@ namespace WiFiLive {
         }
     }
 
-    // The page. Only the latest values, so there is no chart code, no history
-    // buffer, no CSV and nothing sent back to the Calliope.
-    function pageSegments(): string[] {
-        return [
-            "<!DOCTYPE html><html lang=\"de\"><head><meta charset=\"utf-8\">",
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
-            "<title>Calliope Live</title><style>",
-            "body{font-family:system-ui,sans-serif;margin:0;color:#222;background:#fafafa}",
-            "header{background:#42c9c9;color:#fff;padding:.6em 1em}",
-            "h1{font-size:1.2em;margin:0}",
-            "main{margin:1em}",
-            "table{border-collapse:collapse;width:100%;background:#fff}",
-            "th,td{border:1px solid #ddd;padding:.5em .6em;text-align:left}",
-            "th{background:#f3f3f3}",
-            "td.v{text-align:right;font-variant-numeric:tabular-nums}",
-            "#s{color:#888;font-size:13px;margin-top:.6em}",
-            "</style></head><body>",
-            "<header><h1>Calliope Live</h1></header>",
-            "<main><table id=\"t\"></table><div id=\"s\">warte auf Daten...</div></main>",
-            "<script>",
-            "var T=document.getElementById(\"t\"),S=document.getElementById(\"s\");",
-            "async function u(){",
-            "try{",
-            "var r=await fetch(\"/live\",{cache:\"no-store\"});",
-            "var d=await r.text();",
-            "var L=d.split(\"\\n\"),h=\"<tr><th>Knoten</th>\",c=[],i,j;",
-            "for(i=0;i<L.length;i++){if(!L[i])continue;c.push(L[i].split(\",\"));}",
-            "if(!c.length){S.textContent=\"keine Daten\";return;}",
-            "var keys=[];",
-            "for(i=0;i<c.length;i++)for(j=1;j<c[i].length;j++){var k=c[i][j].split(\"=\")[0];if(keys.indexOf(k)<0)keys.push(k);}",
-            "for(j=0;j<keys.length;j++)h+=\"<th>\"+keys[j]+\"</th>\";",
-            "h+=\"</tr>\";",
-            "for(i=0;i<c.length;i++){h+=\"<tr><td>\"+c[i][0]+\"</td>\";",
-            "for(j=0;j<keys.length;j++){var v=\"\";for(var m=1;m<c[i].length;m++){var kv=c[i][m].split(\"=\");if(kv[0]==keys[j])v=kv[1];}",
-            "h+=\"<td class=v>\"+v+\"</td>\";}h+=\"</tr>\";}",
-            "T.innerHTML=h;S.textContent=\"aktualisiert \"+new Date().toLocaleTimeString();",
-            "}catch(e){S.textContent=\"keine Verbindung\";}}",
-            "setInterval(u,2000);u();",
-            "</script></body></html>"
-        ]
+    function buildPage() {
+        if (pageSegs.length == 0) {
+            pageSegs = [
+                "<!DOCTYPE html><html lang=\"de\"><head>",
+                "<meta charset=\"utf-8\">",
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+                "<title>Calliope mini WLAN-Log</title><style>",
+                "body{font-family:\"Roboto\",\"Helvetica Now\",Helvetica,Arial,sans-serif;margin:0;color:#222}",
+                ".header-strip{height:10px;background:rgba(66,201,201,1)}",
+                ".header-contents{padding:0 1em}",
+                "h1{display:block;font-size:2em;margin:.67em 0;font-weight:bold;unicode-bidi:isolate}",
+                "main{margin:1em}",
+                "table{border-collapse:collapse;width:100%}",
+                "th,td{border:1px solid #ddd;padding:8px}",
+                "th{background:#f3f3f3;text-align:left}",
+                "td.v{text-align:right;font-variant-numeric:tabular-nums}",
+                "tr:nth-child(even){background:#f2f2f2}",
+                "#last{color:#555;font-size:13px;margin:.75em 0}",
+                "#meta{color:#555;font-size:13px;margin:.5em 0}",
+                "#status{color:#888;font-size:13px}",
+                "#full{display:none;color:#c00;font-weight:700;font-size:13px;margin:.3em 0}",
+                "#charts{display:flex;flex-wrap:wrap;gap:1em;margin-top:1em}",
+                ".chart{border:1px solid #eee;border-radius:6px;width:420px;max-width:100%}",
+                "button{cursor:pointer;border-radius:23px;min-height:40px;font-weight:700;font-size:14px;padding:0 18px;border:none;background:rgba(66,201,201,1);color:#fff;margin:.5em 0}",
+                ".top{display:flex;flex-wrap:wrap;gap:1em;align-items:flex-start}",
+                ".card{border:1px solid #ddd;border-radius:8px;padding:.6em 1em .9em;background:#fafafa}",
+                ".tablebox{flex:1 1 320px;min-width:280px;max-width:100%}",
+                ".tablebox table{margin-top:.3em}",
+                "#ctrls{flex:0 0 auto;width:280px;max-width:100%}",
+                "#ctrls h2{font-size:15px;margin:.4em 0;color:#4a5261}",
+                "#ctrls .row{display:flex;align-items:center;gap:.6em;margin:.7em 0}",
+                "#ctrls .lbl{width:5em}",
+                "#ctrls input[type=range]{flex:1;min-width:90px}",
+                "#ctrls .val{width:2.5em;text-align:right;font-variant-numeric:tabular-nums}",
+                ".switch{position:relative;display:inline-block;width:64px;height:28px;flex:none}",
+                ".switch input{opacity:0;width:0;height:0}",
+                ".switch .slider{position:absolute;inset:0;cursor:pointer;background:#bbb;border-radius:28px;transition:.2s}",
+                ".switch .slider:before{content:\"\";position:absolute;height:22px;width:22px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.3)}",
+                ".switch .slider:after{content:\"AUS\";position:absolute;right:7px;top:7px;font-size:10px;font-weight:700;color:#fff}",
+                ".switch input:checked + .slider{background:rgba(66,201,201,1)}",
+                ".switch input:checked + .slider:before{transform:translateX(36px)}",
+                ".switch input:checked + .slider:after{content:\"EIN\";left:8px;right:auto}",
+                "footer{margin:1em;color:#888;font-size:13px}",
+                "</style></head><body>",
+                "<header><div class=\"header-strip\"></div>",
+                "<div class=\"header-contents\"><h1>Calliope mini WLAN-Log</h1></div></header>",
+                "<main><div class=\"top\">",
+                "<div class=\"tablebox card\">",
+                "<table id=\"t\"><tr><th>Sensor</th><th>Wert</th></tr></table>",
+                "<div id=\"meta\">Empfangene Pakete: <span id=\"pkts\">0</span></div>",
+                "<div id=\"last\">Letzte Aktualisierung: nie</div>",
+                "<div id=\"full\">Log voll!</div>",
+                "<button onclick=\"dlCsv()\">Als CSV herunterladen</button>",
+                "</div>",
+                "<section id=\"ctrls\" class=\"card\"><h2>Steuerung</h2>",
+                "<div class=\"row\"><span class=\"lbl\">Schalter A</span><label class=\"switch\"><input type=\"checkbox\" id=\"tA\"><span class=\"slider\"></span></label></div>",
+                "<div class=\"row\"><span class=\"lbl\">Schalter B</span><label class=\"switch\"><input type=\"checkbox\" id=\"tB\"><span class=\"slider\"></span></label></div>",
+                "<div class=\"row\"><span class=\"lbl\">Schalter C</span><label class=\"switch\"><input type=\"checkbox\" id=\"tC\"><span class=\"slider\"></span></label></div>",
+                "<div class=\"row\"><span class=\"lbl\">Regler A</span><input type=\"range\" min=\"0\" max=\"100\" value=\"0\" id=\"sA\"><span id=\"sAv\" class=\"val\">0</span></div>",
+                "<div class=\"row\"><span class=\"lbl\">Regler B</span><input type=\"range\" min=\"0\" max=\"100\" value=\"0\" id=\"sB\"><span id=\"sBv\" class=\"val\">0</span></div>",
+                "<div class=\"row\"><span class=\"lbl\">Regler C</span><input type=\"range\" min=\"0\" max=\"100\" value=\"0\" id=\"sC\"><span id=\"sCv\" class=\"val\">0</span></div>",
+                "</section></div>",
+                "<div id=\"charts\"></div>",
+                "<div id=\"status\">warte auf Daten...</div></main>",
+                "<footer>Aktualisiert sich alle 2&nbsp;s &middot; live vom WLAN-Modul</footer>",
+                "<script>",
+                "var s=document.getElementById('status'),tbl=document.getElementById('t'),",
+                "lu=document.getElementById('last'),charts=document.getElementById('charts'),",
+                "full=document.getElementById('full'),pk=document.getElementById('pkts');",
+                "var cols=[],rowEls=[],rows=[],offset=-1;",
+                "var inflight=false,ctrlReady=false,downloading=false;",
+                // Multi-node: when the data has a "node" column, each row is tagged
+                // with its sender and the dashboard groups by node (one chart line
+                // per node). nodeIx<0 means single-source mode (original layout).
+                "var nodeIx=-1,senIx=[],chB=[];",
+                "var PAL=['#42c9c9','#e8743b','#19a979','#945ecf','#cc3c5d','#d39c00'];",
+                "function build(h){cols=h;",
+                "for(var k=0;k<h.length;k++)if(h[k].toLowerCase()=='node')nodeIx=k;",
+                "if(nodeIx<0){",
+                // Single-source: one table row + one chart per column (original).
+                "for(var ci=0;ci<h.length;ci++){",
+                "var tr=tbl.insertRow();tr.insertCell().textContent=h[ci];",
+                "var vc=tr.insertCell();vc.className='v';",
+                "var bx=document.createElement('div');bx.className='chart';charts.appendChild(bx);",
+                "rowEls.push({v:vc,b:bx});}",
+                "}else{",
+                // Multi-node: one chart per sensor column (skip node + any time
+                // column); the table is rebuilt each tick as Node x sensors.
+                "for(var c2=0;c2<h.length;c2++){",
+                "if(c2==nodeIx||h[c2].toLowerCase().indexOf('time')==0)continue;",
+                "senIx.push(c2);",
+                "var b2=document.createElement('div');b2.className='chart';charts.appendChild(b2);chB.push(b2);}",
+                "}}",
+                // The full-log download is a big response. It must NOT run next to
+                // the /data poll: the single-fiber server can't serve two sockets at
+                // once (the browser opens a 2nd connection and gets REFUSED/EMPTY).
+                // So pause polling, wait out any in-flight poll, then fetch with the
+                // socket to ourselves. A 30s abort keeps a stalled download from
+                // freezing the page; polling resumes (and catches up) either way.
+                "async function dlCsv(){if(downloading)return;downloading=true;s.textContent='lade CSV...';",
+                "var ac=new AbortController(),tmo=setTimeout(function(){ac.abort();},30000);try{",
+                "while(inflight)await new Promise(function(r){setTimeout(r,50);});",
+                "var resp=await fetch('/log.csv',{cache:'no-store',signal:ac.signal});",
+                "var t=await resp.text();",
+                "var a=document.createElement('a');a.download='calliope-log.csv';",
+                "a.href=URL.createObjectURL(new Blob([t.replace(/,/g,';')],{type:'text/csv'}));a.click();",
+                "s.textContent='CSV geladen';",
+                "}catch(e){s.textContent='CSV-Download fehlgeschlagen';}",
+                "finally{clearTimeout(tmo);downloading=false;}}",
+                "function svg(title,a){",
+                "var W=420,H=200,pl=46,pr=10,pt=20,pb=22,gw=W-pl-pr,gh=H-pt-pb,i,j;",
+                "var s='<svg viewBox=\"0 0 '+W+' '+H+'\" width=\"100%\" style=\"display:block\">';",
+                "s+='<text x=\"'+pl+'\" y=\"13\" fill=\"#4a5261\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"bold\">'+title+'</text>';",
+                "if(a.length<2)return s+'<text x=\"'+pl+'\" y=\"'+(H/2)+'\" fill=\"#aaa\" font-family=\"sans-serif\" font-size=\"11\">sammle Daten...</text></svg>';",
+                "var mn=Math.min.apply(null,a),mx=Math.max.apply(null,a);if(mn==mx){mn-=1;mx+=1;}",
+                "function yf(v){return (pt+gh-((v-mn)/(mx-mn))*gh).toFixed(1);}",
+                "function xf(q){return (pl+q/(a.length-1)*gw).toFixed(1);}",
+                "s+='<path d=\"M'+pl+' '+pt+'L'+pl+' '+(pt+gh)+'L'+(pl+gw)+' '+(pt+gh)+'\" fill=\"none\" stroke=\"#ccc\"/>';",
+                "var yl=[mx,(mx+mn)/2,mn];",
+                "for(j=0;j<3;j++){var yy=yf(yl[j]);",
+                "s+='<line x1=\"'+pl+'\" y1=\"'+yy+'\" x2=\"'+(pl+gw)+'\" y2=\"'+yy+'\" stroke=\"#eee\"/>';",
+                "s+='<text x=\"2\" y=\"'+(+yy+3)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"10\">'+yl[j].toFixed(1)+'</text>';}",
+                "var p='';for(i=0;i<a.length;i++)p+=xf(i)+','+yf(a[i])+' ';",
+                "s+='<polyline fill=\"none\" stroke=\"rgba(66,201,201,1)\" stroke-width=\"2\" points=\"'+p+'\"/>';",
+                "var tk=4;for(i=0;i<=tk;i++){var f=i/tk,xx=(pl+f*gw).toFixed(1),ago=Math.round((1-f)*(a.length-1)*2);",
+                "s+='<line x1=\"'+xx+'\" y1=\"'+(pt+gh)+'\" x2=\"'+xx+'\" y2=\"'+(pt+gh+3)+'\" stroke=\"#ccc\"/>';",
+                "s+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}",
+                "return s+'</svg>';}",
+                // Multi-series chart: one labelled, coloured line per node.
+                "function svgM(title,series){",
+                "var W=420,H=210,pl=46,pr=10,pt=22,pb=22,gw=W-pl-pr,gh=H-pt-pb,i,k;",
+                "var o='<svg viewBox=\"0 0 '+W+' '+H+'\" width=\"100%\" style=\"display:block\">';",
+                "o+='<text x=\"'+pl+'\" y=\"13\" fill=\"#4a5261\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"bold\">'+title+'</text>';",
+                "var all=[];for(k=0;k<series.length;k++)for(i=0;i<series[k].v.length;i++)all.push(series[k].v[i]);",
+                "if(all.length<2)return o+'<text x=\"'+pl+'\" y=\"'+(H/2)+'\" fill=\"#aaa\" font-family=\"sans-serif\" font-size=\"11\">sammle Daten...</text></svg>';",
+                "var mn=Math.min.apply(null,all),mx=Math.max.apply(null,all);if(mn==mx){mn-=1;mx+=1;}",
+                "var ml=2;for(k=0;k<series.length;k++)if(series[k].v.length>ml)ml=series[k].v.length;",
+                "function yf(val){return (pt+gh-((val-mn)/(mx-mn))*gh).toFixed(1);}",
+                "function xf(q,len){return (pl+(len<2?gw:q/(len-1)*gw)).toFixed(1);}",
+                "o+='<path d=\"M'+pl+' '+pt+'L'+pl+' '+(pt+gh)+'L'+(pl+gw)+' '+(pt+gh)+'\" fill=\"none\" stroke=\"#ccc\"/>';",
+                "var yl=[mx,(mx+mn)/2,mn];",
+                "for(i=0;i<3;i++){var yy=yf(yl[i]);",
+                "o+='<line x1=\"'+pl+'\" y1=\"'+yy+'\" x2=\"'+(pl+gw)+'\" y2=\"'+yy+'\" stroke=\"#eee\"/>';",
+                "o+='<text x=\"2\" y=\"'+(+yy+3)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"10\">'+yl[i].toFixed(1)+'</text>';}",
+                "for(k=0;k<series.length;k++){var a=series[k].v,p='';for(i=0;i<a.length;i++)p+=xf(i,a.length)+','+yf(a[i])+' ';",
+                "o+='<polyline fill=\"none\" stroke=\"'+series[k].c+'\" stroke-width=\"2\" points=\"'+p+'\"/>';}",
+                "var tk=4;for(i=0;i<=tk;i++){var f=i/tk,xx=(pl+f*gw).toFixed(1),ago=Math.round((1-f)*(ml-1)*2);",
+                "o+='<line x1=\"'+xx+'\" y1=\"'+(pt+gh)+'\" x2=\"'+xx+'\" y2=\"'+(pt+gh+3)+'\" stroke=\"#ccc\"/>';",
+                "o+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}",
+                "var lx=pl+4;for(k=0;k<series.length;k++){",
+                "o+='<rect x=\"'+lx+'\" y=\"'+(pt-9)+'\" width=\"9\" height=\"9\" fill=\"'+series[k].c+'\"/>';",
+                "o+='<text x=\"'+(lx+12)+'\" y=\"'+(pt-1)+'\" fill=\"#555\" font-family=\"sans-serif\" font-size=\"10\">'+series[k].n+'</text>';",
+                "lx+=22+series[k].n.length*6;}",
+                "return o+'</svg>';}",
+                // Render the Node x sensors table and one per-sensor chart (a line
+                // per node) from the buffered rows. Used when nodeIx>=0.
+                "function renderN(){var seen={},nodes=[],i,j,k;",
+                "for(i=0;i<rows.length;i++){var nv=rows[i][nodeIx];if(nv!==undefined&&seen[nv]===undefined){seen[nv]=1;nodes.push(nv);}}",
+                "if(!nodes.length)return;",
+                "var h='<tr><th>Node</th>';for(j=0;j<senIx.length;j++)h+='<th>'+cols[senIx[j]]+'</th>';h+='</tr>';",
+                "for(k=0;k<nodes.length;k++){var r=null;for(i=rows.length-1;i>=0;i--){if(rows[i][nodeIx]==nodes[k]){r=rows[i];break;}}",
+                "h+='<tr><td>'+nodes[k]+'</td>';",
+                "for(j=0;j<senIx.length;j++){var ci=senIx[j];h+='<td class=\"v\">'+((r&&r[ci]!==undefined)?r[ci]:'')+'</td>';}h+='</tr>';}",
+                "tbl.innerHTML=h;",
+                "var win=rows.slice(-400);",
+                "for(j=0;j<senIx.length;j++){var c2=senIx[j],series=[];",
+                "for(k=0;k<nodes.length;k++){var v=[];",
+                "for(i=0;i<win.length;i++){if(win[i][nodeIx]!=nodes[k])continue;var fv=parseFloat(win[i][c2]);if(!isNaN(fv))v.push(fv);}",
+                "series.push({n:nodes[k],c:PAL[k%PAL.length],v:v});}",
+                "chB[j].innerHTML=svgM(cols[c2],series);}}",
+                "function ctrlQ(){return '&tA='+(elT[0].checked?1:0)+'&tB='+(elT[1].checked?1:0)+'&tC='+(elT[2].checked?1:0)+'&sA='+elS[0].value+'&sB='+elS[1].value+'&sC='+elS[2].value;}",
+                "async function tick(){if(inflight||downloading)return;inflight=true;",
+                "var ac=new AbortController(),tmo=setTimeout(function(){ac.abort();},5000);try{",
+                "var ts=Math.floor(Date.now()/1000);",
+                "var url=(offset<0?'/data?t='+ts:'/data?from='+offset+'&t='+ts)+(ctrlReady?ctrlQ():'');",
+                "var resp=await fetch(url,{cache:'no-store',signal:ac.signal});",
+                "full.style.display=(resp.headers.get('X-Log-Full')=='1')?'':'none';",
+                "var tot=resp.headers.get('X-Total-Rows');if(tot!=null)pk.textContent=tot;",
+                "var rc=parseInt(resp.headers.get('X-Row-Count')||'-1');",
+                // Row count went backwards -> the device restarted/reset its log.
+                // Our buffered rows are now stale; drop them and reseed next poll.
+                "if(rc>=0&&offset>=0&&rc<offset){console.log('reset: Neustart erkannt rc='+rc+' offset='+offset);rows.length=0;offset=-1;return;}",
+                "var t=await resp.text();",
+                "var L=t.replace(/\\r/g,'').split('\\n'),nr=[],li;",
+                "for(li=0;li<L.length;li++)if(L[li].length)nr.push(L[li].split(','));",
+                "if(rc>=0)offset=rc;",
+                "if(!cols.length&&nr.length)build(nr[0]);",
+                "for(var ri=1;ri<nr.length;ri++)rows.push(nr[ri]);",
+                "if(rows.length>500)rows.splice(0,rows.length-500);",
+                "console.log('poll: X-Row-Count='+rc+' neueZeilen='+(nr.length>0?nr.length-1:0)+' offset='+offset+' puffer='+rows.length);",
+                "if(!rows.length){s.textContent='(warte auf Daten...)';return;}",
+                "if(nodeIx>=0){renderN();}else{",
+                "var d=rows.slice(-100),last=d[d.length-1],ci;",
+                "for(ci=0;ci<cols.length;ci++){if(!rowEls[ci])continue;",
+                "rowEls[ci].v.textContent=last[ci]!==undefined?last[ci]:'';",
+                "var arr=[],di;for(di=0;di<d.length;di++){var f=parseFloat(d[di][ci]);arr.push(isNaN(f)?0:f);}",
+                "rowEls[ci].b.innerHTML=svg(cols[ci],arr);}}",
+                "lu.textContent='Letzte Aktualisierung: '+new Date().toLocaleString();",
+                "s.textContent='aktualisiert';",
+                "}catch(e){s.textContent='(warte auf Daten...)';}",
+                "finally{clearTimeout(tmo);inflight=false;}}",
+                "var elT=[document.getElementById('tA'),document.getElementById('tB'),document.getElementById('tC')];",
+                "var elS=[document.getElementById('sA'),document.getElementById('sB'),document.getElementById('sC')];",
+                "var elSv=[document.getElementById('sAv'),document.getElementById('sBv'),document.getElementById('sCv')];",
+                // Controls ride along on the next /data poll (no separate request,
+                // so no collision with polling). Flipping a control triggers an
+                // immediate tick() for snappy response; the inflight guard keeps
+                // it from overlapping the periodic poll.
+                "elT.forEach(function(e){e.addEventListener('change',tick);});",
+                "elS.forEach(function(e,i){e.addEventListener('change',tick);e.addEventListener('input',function(){elSv[i].textContent=e.value;});});",
+                "fetch('/controls',{cache:'no-store'}).then(function(r){return r.json();}).then(function(c){",
+                "elT[0].checked=c.tA==1;elT[1].checked=c.tB==1;elT[2].checked=c.tC==1;",
+                "elS[0].value=c.sA;elS[1].value=c.sB;elS[2].value=c.sC;",
+                "elSv[0].textContent=c.sA;elSv[1].textContent=c.sB;elSv[2].textContent=c.sC;",
+                "ctrlReady=true;});",
+                "setInterval(tick,2000);tick();",
+                "</script></body></html>",
+            ]
+        }
+    }
+
+    function logRowsCsv(clientFrom: number): string {
+        let total = datalogger.getNumberOfRows()   // includes header row 0
+        let totalData = total - 1
+        lastTotalRows = totalData > 0 ? totalData : 0   // total recorded rows -> X-Total-Rows
+        if (total <= 1) { lastRowCount = 0; return "" }
+        let startData: number
+        if (clientFrom < 0) {
+            // First connection: seed with the last SEED_ROWS data rows
+            startData = totalData - SEED_ROWS
+            if (startData < 0) startData = 0
+        } else {
+            // Diff: only rows the client hasn't seen yet
+            if (clientFrom >= totalData) { lastRowCount = totalData; return "" }
+            startData = clientFrom
+        }
+        let count = totalData - startData
+        if (count > MAX_ROWS_PER_POLL) count = MAX_ROWS_PER_POLL
+        lastRowCount = startData + count   // client's new cursor (may be < totalData)
+        let startIdx = startData + 1       // +1 because row 0 is the header
+        return datalogger.getRows(0, 1) + "\n" + datalogger.getRows(startIdx, count)
+    }
+
+    function httpDataResponse(body: string): string {
+        return "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/csv; charset=utf-8\r\n" +
+            "Content-Length: " + body.length + "\r\n" +
+            "Cache-Control: no-cache\r\n" +
+            "X-Log-Full: " + (logFull ? "1" : "0") + "\r\n" +
+            "X-Row-Count: " + lastRowCount + "\r\n" +
+            "X-Total-Rows: " + lastTotalRows + "\r\n" +
+            "Connection: keep-alive\r\n\r\n" + body
+    }
+
+    function httpResponse(status: string, contentType: string, body: string): string {
+        // Connection: keep-alive -> the browser reuses ONE socket for every poll
+        // instead of reconnecting each time, avoiding the open/close churn that
+        // fragments the module's heap and eventually reboots it.
+        // X-Log-Full lets the page show a "log full" banner.
+        return "HTTP/1.1 " + status + "\r\n" +
+            "Content-Type: " + contentType + "; charset=utf-8\r\n" +
+            "Content-Length: " + body.length + "\r\n" +
+            "Cache-Control: no-cache\r\n" +
+            "X-Log-Full: " + (logFull ? "1" : "0") + "\r\n" +
+            "Connection: keep-alive\r\n\r\n" + body
+    }
+
+    function controlsJson(): string {
+        return "{\"tA\":" + (ctrlToggle[0] ? "1" : "0") +
+            ",\"tB\":" + (ctrlToggle[1] ? "1" : "0") +
+            ",\"tC\":" + (ctrlToggle[2] ? "1" : "0") +
+            ",\"sA\":" + ctrlSlider[0] +
+            ",\"sB\":" + ctrlSlider[1] +
+            ",\"sC\":" + ctrlSlider[2] + "}"
+    }
+
+    function applyControls(path: string) {
+        let q = path.indexOf("?")
+        if (q < 0) return
+        let parts = path.substr(q + 1).split("&")
+        for (let i = 0; i < parts.length; i++) {
+            let eq = parts[i].indexOf("=")
+            if (eq < 0) continue
+            let key = parts[i].substr(0, eq)
+            let val = parts[i].substr(eq + 1)
+            if (key == "tA") ctrlToggle[0] = val == "1"
+            else if (key == "tB") ctrlToggle[1] = val == "1"
+            else if (key == "tC") ctrlToggle[2] = val == "1"
+            else if (key == "sA") ctrlSlider[0] = clampPct(val)
+            else if (key == "sB") ctrlSlider[1] = clampPct(val)
+            else if (key == "sC") ctrlSlider[2] = clampPct(val)
+        }
+    }
+
+    function syncTimeFromQuery(path: string) {
+        let t = parseQueryInt(path, "t")
+        if (t > 0) {
+            syncedEpochSec = t
+            syncedDeviceMs = input.runningTime()
+            timeSynced = true
+        }
+    }
+
+    function parseQueryInt(path: string, key: string): number {
+        let q = path.indexOf("?")
+        if (q < 0) return -1
+        let parts = path.substr(q + 1).split("&")
+        for (let i = 0; i < parts.length; i++) {
+            let eq = parts[i].indexOf("=")
+            if (eq < 0) continue
+            if (parts[i].substr(0, eq) == key) {
+                let n = Math.round(parseFloat(parts[i].substr(eq + 1)))
+                return isNaN(n) ? -1 : n
+            }
+        }
+        return -1
+    }
+
+    function serveLogCsv(linkId: string) {
+        let total = datalogger.getNumberOfRows()   // includes the header row
+        let BATCH = 20
+        let bodyLen = 0
+        let i = 0
+        let first = true
+        while (i < total) {
+            let n = total - i
+            if (n > BATCH) n = BATCH
+            if (!first) bodyLen += 1                 // the "\n" that joins batches
+            bodyLen += datalogger.getRows(i, n).length
+            first = false
+            i += n
+        }
+        let head = "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/csv; charset=utf-8\r\n" +
+            "Content-Length: " + bodyLen + "\r\n" +
+            "Cache-Control: no-cache\r\n" +
+            "X-Log-Full: " + (logFull ? "1" : "0") + "\r\n" +
+            "Connection: keep-alive\r\n\r\n"
+        if (!sendChunk(linkId, head)) return
+        i = 0
+        first = true
+        while (i < total) {
+            let n = total - i
+            if (n > BATCH) n = BATCH
+            let piece = (first ? "" : "\n") + datalogger.getRows(i, n)
+            if (!sendChunk(linkId, piece)) return
+            first = false
+            i += n
+            basic.pause(20)
+        }
+    }
+
+    // Send a prebuilt response in <=CHUNK pieces.
+    function serveResponse(linkId: string, response: string) {
+        let i = 0
+        while (i < response.length) {
+            if (!sendChunk(linkId, response.substr(i, CHUNK))) return
+            i += CHUNK
+            basic.pause(20)
+        }
+        if (!peerClosed) {
+            sendAtCmd("AT+CIPCLOSE=" + linkId)
+            waitAt("OK", "ERROR", "CLOSED", 500)
+        }
+    }
+
+    function clampPct(s: string): number {
+        let n = Math.round(parseFloat(s))
+        if (isNaN(n)) return 0
+        return Math.max(0, Math.min(100, n))
     }
 
     // ==================================================================
