@@ -886,7 +886,7 @@ namespace WiFiLive {
                 "s+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}",
                 "return s+'</svg>';}",
                 // Multi-series chart: one labelled, coloured line per node.
-                "function svgM(title,series){",
+                "function svgM(title,series,winLen){",
                 // pt (top padding) leaves room for the column title AND the node legend
                 // underneath it. At pt=22 the two sat 8 px apart and read as one
                 // block; 32 separates them clearly. H grows to match so the plot
@@ -897,17 +897,18 @@ namespace WiFiLive {
                 "var all=[];for(k=0;k<series.length;k++)for(i=0;i<series[k].v.length;i++)all.push(series[k].v[i]);",
                 "if(all.length<2)return o+'<text x=\"'+pl+'\" y=\"'+(H/2)+'\" fill=\"#aaa\" font-family=\"sans-serif\" font-size=\"11\">sammle Daten...</text></svg>';",
                 "var mn=Math.min.apply(null,all),mx=Math.max.apply(null,all);if(mn==mx){mn-=1;mx+=1;}",
-                "var ml=2;for(k=0;k<series.length;k++)if(series[k].v.length>ml)ml=series[k].v.length;",
                 "function yf(val){return (pt+gh-((val-mn)/(mx-mn))*gh).toFixed(1);}",
-                "function xf(q,len){return (pl+(len<2?gw:q/(len-1)*gw)).toFixed(1);}",
+                // x is the position in the shared window, not within one series, so all
+                // nodes share one time axis.
+                "function xf(q){return (pl+(winLen<2?gw:q/(winLen-1)*gw)).toFixed(1);}",
                 "o+='<path d=\"M'+pl+' '+pt+'L'+pl+' '+(pt+gh)+'L'+(pl+gw)+' '+(pt+gh)+'\" fill=\"none\" stroke=\"#ccc\"/>';",
                 "var yl=[mx,(mx+mn)/2,mn];",
                 "for(i=0;i<3;i++){var yy=yf(yl[i]);",
                 "o+='<line x1=\"'+pl+'\" y1=\"'+yy+'\" x2=\"'+(pl+gw)+'\" y2=\"'+yy+'\" stroke=\"#eee\"/>';",
                 "o+='<text x=\"2\" y=\"'+(+yy+3)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"10\">'+yl[i].toFixed(1)+'</text>';}",
-                "for(k=0;k<series.length;k++){var a=series[k].v,p='';for(i=0;i<a.length;i++)p+=xf(i,a.length)+','+yf(a[i])+' ';",
+                "for(k=0;k<series.length;k++){var a=series[k].v,ax=series[k].x,p='';for(i=0;i<a.length;i++)p+=xf(ax[i])+','+yf(a[i])+' ';",
                 "o+='<polyline fill=\"none\" stroke=\"'+series[k].c+'\" stroke-width=\"2\" points=\"'+p+'\"/>';}",
-                "var tk=4;for(i=0;i<=tk;i++){var f=i/tk,xx=(pl+f*gw).toFixed(1),ago=Math.round((1-f)*(ml-1)*2);",
+                "var tk=4;for(i=0;i<=tk;i++){var f=i/tk,xx=(pl+f*gw).toFixed(1),ago=Math.round((1-f)*(winLen-1)*2);",
                 "o+='<line x1=\"'+xx+'\" y1=\"'+(pt+gh)+'\" x2=\"'+xx+'\" y2=\"'+(pt+gh+3)+'\" stroke=\"#ccc\"/>';",
                 "o+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}",
                 "var lx=pl+4;for(k=0;k<series.length;k++){",
@@ -928,9 +929,14 @@ namespace WiFiLive {
                 "var win=rows.slice(-400);",
                 "for(j=0;j<senIx.length;j++){var c2=senIx[j],series=[];",
                 "for(k=0;k<nodes.length;k++){var v=[];",
-                "for(i=0;i<win.length;i++){if(win[i][nodeIx]!=nodes[k])continue;var fv=parseFloat(win[i][c2]);if(!isNaN(fv))v.push(fv);}",
-                "series.push({n:nodes[k],c:PAL[k%PAL.length],v:v});}",
-                "chB[j].innerHTML=svgM(cols[c2],series);}}",
+                // Record each value with its index in the SHARED window, so a node that
+                // joined late is drawn only over the span it was actually present
+                // for. Keying off the series' own length instead stretched three
+                // fresh points across the whole plot, back to "-42s".
+                "var xs=[];",
+                "for(i=0;i<win.length;i++){if(win[i][nodeIx]!=nodes[k])continue;var fv=parseFloat(win[i][c2]);if(!isNaN(fv)){v.push(fv);xs.push(i);}}",
+                "series.push({n:nodes[k],c:PAL[k%PAL.length],v:v,x:xs});}",
+                "chB[j].innerHTML=svgM(cols[c2],series,win.length);}}",
                 "function ctrlQ(){return '&tA='+(elT[0].checked?1:0)+'&tB='+(elT[1].checked?1:0)+'&tC='+(elT[2].checked?1:0)+'&sA='+elS[0].value+'&sB='+elS[1].value+'&sC='+elS[2].value;}",
                 "async function tick(){if(inflight||downloading)return;inflight=true;",
                 "var ac=new AbortController(),tmo=setTimeout(function(){ac.abort();},5000);try{",
