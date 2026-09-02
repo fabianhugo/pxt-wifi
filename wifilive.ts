@@ -14,23 +14,22 @@
  * occupies the UART for ~1.1 s, and building that page as one string is what
  * caused the GC_TOO_BIG_ALLOCATION (error 022) crashes.
  *
- * This page is ~1.6 KB (-87%, ~0.14 s per load) because it answers a different
- * question: "what is every sensor reading right now?" That needs only the LAST
- * value per node, which is kept in RAM. The datalogger is never read to serve a
- * request, so no history, no diff cursor, no CSV, and nothing is sent from the
- * browser back to the Calliope.
+ * The dashboard is back, but the transport fixes found while building the
+ * values-only page are kept: requests rescued out of AT replies, a bounded
+ * rxBuf, drain-then-parse ordering, and no reply to node pushes. Those are what
+ * made it survive two nodes plus a phone.
  *
- * Logging to flash still happens if you want it -- see logToFlash below -- but
- * it is independent of what the page shows.
+ * /live still returns just the latest values as plain text, for a minimal
+ * client that does not want the charts.
  *
  * HUB PROGRAM (one board)
- *   datalogger.setColumnTitles("node", "temp", "licht")   // REQUIRED for charts
- *   WiFiLive.startLiveHub(SerialPin.C17, SerialPin.C16, "CalliopeHub", "")
+ *   WiFiLive.startLiveHub(SerialPin.C17, SerialPin.C16, "CalliopeHub", "",
+ *                         "temp", "licht")
  *   // then open http://10.0.0.1 on a phone joined to that network
  *
- * The column titles matter: the charts and the CSV are read back OUT of the
- * flash log, so the titles must include "node" plus the sensor names the nodes
- * send. Without them the table and plots come up empty.
+ * The column names are part of the block: the charts and the CSV are read back
+ * OUT of the flash log, so they have to be set before anything is logged. The
+ * "node" column is added automatically as the first one -- do not list it.
  *
  * NODE PROGRAM (each other board)
  *   WiFiLive.joinHub(SerialPin.C17, SerialPin.C16, "CalliopeHub", "")
@@ -46,8 +45,8 @@
  */
 
 // Debug output over software serial: wire a USB-TTL adapter's RX to P2, 4800 baud.
-let debugLIVE = false
-let debugLIVEPIN = DigitalPin.P2
+let debugLIVE = true
+let debugLIVEPIN = DigitalPin.P19
 let debugLIVEBAUD = softSerial.BaudRate.Baud4800
 
 //% weight=8 color=#7B68EE icon="\uf0e4" block="WiFi Live"
@@ -109,6 +108,12 @@ namespace WiFiLive {
     let joined = false
     let hubHost = AP_IP
     let pushStage = 0
+    // Remembered from joinHub so a dropped node can rejoin by itself.
+    let joinTx = SerialPin.C17
+    let joinRx = SerialPin.C16
+    let joinSsid = ""
+    let joinPass = ""
+    let lastRejoin = 0
 
     let pendingCmd = ""
     // Text of the most recent AT reply, so callers can inspect it without
@@ -123,16 +128,23 @@ namespace WiFiLive {
     // ==================================================================
 
     /**
-     * Start the live hub: make the WiFi network the other minis join, and serve
-     * a page showing their current readings.
+     * Start the live hub: make the WiFi network the other minis join, log what
+     * they send, and serve the dashboard.
+     *
+     * Name the sensor columns the nodes will send (temp, licht, ...). The
+     * "node" column is added automatically as the first one, because the
+     * dashboard needs it to tell the minis apart -- do not list it yourself.
      */
-    //% block="start live hub|TX %tx|RX %rx|network name %name|password %pass"
+    //% block="start live hub|TX %tx|RX %rx|network name %name|password %pass|columns %col1||%col2 %col3 %col4 %col5"
     //% tx.defl=SerialPin.C17
     //% rx.defl=SerialPin.C16
     //% name.defl="CalliopeHub"
+    //% col1.defl="temp"
+    //% inlineInputMode="variable"
+    //% inlineInputModeLimit=1
     //% group="Hub"
     //% weight=100
-    export function startLiveHub(tx: SerialPin, rx: SerialPin, name: string, pass: string) {
+    export function startLiveHub(tx: SerialPin, rx: SerialPin, name: string, pass: string, col1: string, col2?: string, col3?: string, col4?: string, col5?: string) {
         txPin = tx
         rxPin = rx
         ssid = name
@@ -141,6 +153,17 @@ namespace WiFiLive {
         nodeData = []
         nodeSeen = []
         pushCount = 0
+
+        // "node" is fixed and always first: ingest() writes it as column 0, and
+        // the dashboard groups the table and the chart series by it. Setting the
+        // titles here means the hub program cannot forget to -- getting them
+        // wrong left the charts silently empty.
+        // setColumnTitles drops empty/undefined arguments itself (it filters on
+        // !!el), so unused slots can be passed straight through.
+        datalogger.setColumnTitles("node", col1, col2, col3, col4, col5)
+
+        // The page shows a banner when the flash log fills up.
+        datalogger.onLogFull(function () { logFull = true })
 
         apSetup()
         startBackgroundServer()
@@ -206,6 +229,10 @@ namespace WiFiLive {
     //% group="Node"
     //% weight=70
     export function joinHub(tx: SerialPin, rx: SerialPin, name: string, pass: string): boolean {
+        joinTx = tx
+        joinRx = rx
+        joinSsid = name
+        joinPass = pass
         joined = false
         serial.redirect(tx, rx, BaudRate.BaudRate115200)
         serial.setRxBufferSize(254)
@@ -263,7 +290,29 @@ namespace WiFiLive {
         for (let i = 0; i < cvs.length; i++) {
             q += "&" + enc(cvs[i].column) + "=" + enc(cvs[i].value)
         }
+        // Do not push over a link that is not up. Hardware log showed 39
+        // consecutive failures doing exactly that: the node had never joined (or
+        // had been dropped -- 8x WIFI CONNECTED but only 2x WIFI GOT IP), and
+        // every push still ran a full CIPCLOSE/CIPMUX/CIPSTART x2 sequence
+        // against nothing. That AT churn is what drove the module into
+        // "busy p..." where it stopped answering even a plain AT.
+        if (!joined) {
+            rejoin()
+            if (!joined) {
+                pushStage = 1
+                note("push skipped: not joined")
+                return false
+            }
+        }
+
         let ok = pushQuery(q)
+        if (!ok && pushStage == 1) {
+            // Could not reach the hub. The usual cause is that the WiFi link
+            // dropped underneath us, so try once to get it back -- otherwise the
+            // node stays dead until the program is restarted.
+            joined = false
+            rejoin()
+        }
         note(ok ? "push ok: " + q : "push FAILED (" + failReason() + ")")
         return ok
     }
@@ -278,6 +327,24 @@ namespace WiFiLive {
     //% advanced=true
     export function pushStatus(): number {
         return pushStage
+    }
+
+    // Re-join the network we were told about, at most every REJOIN_MS.
+    //
+    // The rate limit is essential: a FAILING join is expensive -- three CWJAP
+    // attempts at a 20 s timeout each, so up to ~60 s. Two details matter and
+    // both were got wrong first time:
+    //   * the window must exceed that worst case, or the next push rejoins
+    //     immediately and the node does nothing but join;
+    //   * lastRejoin is stamped AFTER the attempt, not before, so the wait is
+    //     measured from when we stopped trying rather than when we started.
+    const REJOIN_MS = 30000
+    function rejoin() {
+        if (joinSsid.length == 0) return              // joinHub was never called
+        if (lastRejoin != 0 && (input.runningTime() - lastRejoin) < REJOIN_MS) return
+        note("node: link lost, rejoining " + joinSsid)
+        joinHub(joinTx, joinRx, joinSsid, joinPass)
+        lastRejoin = input.runningTime()
     }
 
     function failReason(): string {
@@ -670,7 +737,7 @@ namespace WiFiLive {
                 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
                 "<title>Calliope mini WLAN-Log</title><style>",
                 "body{font-family:\"Roboto\",\"Helvetica Now\",Helvetica,Arial,sans-serif;margin:0;color:#222}",
-                ".header-strip{height:10px;background:rgba(66,201,201,1)}",
+                ".header-strip{height:10px;background:#bbef53}",
                 ".header-contents{padding:0 1em}",
                 "h1{display:block;font-size:2em;margin:.67em 0;font-weight:bold;unicode-bidi:isolate}",
                 "main{margin:1em}",
@@ -681,15 +748,30 @@ namespace WiFiLive {
                 "tr:nth-child(even){background:#f2f2f2}",
                 "#last{color:#555;font-size:13px;margin:.75em 0}",
                 "#meta{color:#555;font-size:13px;margin:.5em 0}",
-                "#status{color:#888;font-size:13px}",
+                "#status{color:#888;font-size:13px;margin:.6em 0}",
+                // The waiting state is what the user stares at, so make it
+                // readable and visibly alive. Three dots fade in turn, animated
+                // in CSS -- nothing is added to the 2 s poll and it keeps moving
+                // even while a request is in flight.
+                //
+                // Opacity on three spans, NOT an animated content: property --
+                // animating content is not supported everywhere and would simply
+                // show no dots at all on the browsers that skip it.
+                "#status.wait{color:#5a7a10;font-size:16px;font-weight:700}",
+                "#status .d{animation:b 1.2s infinite}",
+                "#status .d:nth-child(2){animation-delay:.2s}",
+                "#status .d:nth-child(3){animation-delay:.4s}",
+                "@keyframes b{0%,60%,100%{opacity:.2}30%{opacity:1}}",
                 "#full{display:none;color:#c00;font-weight:700;font-size:13px;margin:.3em 0}",
                 "#charts{display:flex;flex-wrap:wrap;gap:1em;margin-top:1em}",
                 ".chart{border:1px solid #eee;border-radius:6px;width:420px;max-width:100%}",
-                "button{cursor:pointer;border-radius:23px;min-height:40px;font-weight:700;font-size:14px;padding:0 18px;border:none;background:rgba(66,201,201,1);color:#fff;margin:.5em 0}",
+                "button{cursor:pointer;border-radius:23px;min-height:40px;font-weight:700;font-size:14px;padding:0 18px;border:none;background:#bbef53;color:#233;margin:.5em 0}",
+                "button:disabled{background:#ddd;color:#999;cursor:default}",
                 ".top{display:flex;flex-wrap:wrap;gap:1em;align-items:flex-start}",
                 ".card{border:1px solid #ddd;border-radius:8px;padding:.6em 1em .9em;background:#fafafa}",
                 ".tablebox{flex:1 1 320px;min-width:280px;max-width:100%}",
                 ".tablebox table{margin-top:.3em}",
+                ".dlrow{display:flex;justify-content:flex-end}",
                 "#ctrls{flex:0 0 auto;width:280px;max-width:100%}",
                 "#ctrls h2{font-size:15px;margin:.4em 0;color:#4a5261}",
                 "#ctrls .row{display:flex;align-items:center;gap:.6em;margin:.7em 0}",
@@ -701,7 +783,7 @@ namespace WiFiLive {
                 ".switch .slider{position:absolute;inset:0;cursor:pointer;background:#bbb;border-radius:28px;transition:.2s}",
                 ".switch .slider:before{content:\"\";position:absolute;height:22px;width:22px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.3)}",
                 ".switch .slider:after{content:\"AUS\";position:absolute;right:7px;top:7px;font-size:10px;font-weight:700;color:#fff}",
-                ".switch input:checked + .slider{background:rgba(66,201,201,1)}",
+                ".switch input:checked + .slider{background:#bbef53}",
                 ".switch input:checked + .slider:before{transform:translateX(36px)}",
                 ".switch input:checked + .slider:after{content:\"EIN\";left:8px;right:auto}",
                 "footer{margin:1em;color:#888;font-size:13px}",
@@ -714,7 +796,11 @@ namespace WiFiLive {
                 "<div id=\"meta\">Empfangene Pakete: <span id=\"pkts\">0</span></div>",
                 "<div id=\"last\">Letzte Aktualisierung: nie</div>",
                 "<div id=\"full\">Log voll!</div>",
-                "<button onclick=\"dlCsv()\">Als CSV herunterladen</button>",
+                // The waiting indicator lives here, where the eye already is --
+                // next to the values -- rather than far below the charts.
+                "<div id=\"status\" class=\"wait\">warte auf Daten<span class=\"d\">.</span><span class=\"d\">.</span><span class=\"d\">.</span></div>",
+                // Button right-aligned inside the card.
+                "<div class=\"dlrow\"><button id=\"dl\" onclick=\"dlCsv()\">Als CSV herunterladen</button></div>",
                 "</div>",
                 "<section id=\"ctrls\" class=\"card\"><h2>Steuerung</h2>",
                 "<div class=\"row\"><span class=\"lbl\">Schalter A</span><label class=\"switch\"><input type=\"checkbox\" id=\"tA\"><span class=\"slider\"></span></label></div>",
@@ -724,20 +810,20 @@ namespace WiFiLive {
                 "<div class=\"row\"><span class=\"lbl\">Regler B</span><input type=\"range\" min=\"0\" max=\"100\" value=\"0\" id=\"sB\"><span id=\"sBv\" class=\"val\">0</span></div>",
                 "<div class=\"row\"><span class=\"lbl\">Regler C</span><input type=\"range\" min=\"0\" max=\"100\" value=\"0\" id=\"sC\"><span id=\"sCv\" class=\"val\">0</span></div>",
                 "</section></div>",
-                "<div id=\"charts\"></div>",
-                "<div id=\"status\">warte auf Daten...</div></main>",
+                "<div id=\"charts\"></div></main>",
                 "<footer>Aktualisiert sich alle 2&nbsp;s &middot; live vom WLAN-Modul</footer>",
                 "<script>",
                 "var s=document.getElementById('status'),tbl=document.getElementById('t'),",
                 "lu=document.getElementById('last'),charts=document.getElementById('charts'),",
                 "full=document.getElementById('full'),pk=document.getElementById('pkts');",
+                "var WAIT='warte auf Daten<span class=\"d\">.</span><span class=\"d\">.</span><span class=\"d\">.</span>';",
                 "var cols=[],rowEls=[],rows=[],offset=-1;",
                 "var inflight=false,ctrlReady=false,downloading=false;",
                 // Multi-node: when the data has a "node" column, each row is tagged
                 // with its sender and the dashboard groups by node (one chart line
                 // per node). nodeIx<0 means single-source mode (original layout).
                 "var nodeIx=-1,senIx=[],chB=[];",
-                "var PAL=['#42c9c9','#e8743b','#19a979','#945ecf','#cc3c5d','#d39c00'];",
+                "var PAL=['#8bc220','#e8743b','#19a979','#945ecf','#cc3c5d','#d39c00'];",
                 "function build(h){cols=h;",
                 "for(var k=0;k<h.length;k++)if(h[k].toLowerCase()=='node')nodeIx=k;",
                 "if(nodeIx<0){",
@@ -761,7 +847,13 @@ namespace WiFiLive {
                 // So pause polling, wait out any in-flight poll, then fetch with the
                 // socket to ourselves. A 30s abort keeps a stalled download from
                 // freezing the page; polling resumes (and catches up) either way.
-                "async function dlCsv(){if(downloading)return;downloading=true;s.textContent='lade CSV...';",
+                "async function dlCsv(){if(downloading)return;downloading=true;",
+                // Grey the button while the log is gathered, and keep it greyed
+                // for at least 5 s so a click always gives visible feedback even
+                // when the download finishes almost instantly.
+                "var B=document.getElementById('dl'),t0=Date.now();",
+                "if(B){B.disabled=true;B.textContent='sammle Daten...';}",
+                "s.textContent='lade CSV...';",
                 "var ac=new AbortController(),tmo=setTimeout(function(){ac.abort();},30000);try{",
                 "while(inflight)await new Promise(function(r){setTimeout(r,50);});",
                 "var resp=await fetch('/log.csv',{cache:'no-store',signal:ac.signal});",
@@ -770,7 +862,10 @@ namespace WiFiLive {
                 "a.href=URL.createObjectURL(new Blob([t.replace(/,/g,';')],{type:'text/csv'}));a.click();",
                 "s.textContent='CSV geladen';",
                 "}catch(e){s.textContent='CSV-Download fehlgeschlagen';}",
-                "finally{clearTimeout(tmo);downloading=false;}}",
+                "finally{clearTimeout(tmo);",
+                "var wait=5000-(Date.now()-t0);if(wait<0)wait=0;",
+                "setTimeout(function(){if(B){B.disabled=false;B.textContent='Als CSV herunterladen';}downloading=false;},wait);",
+                "}}",
                 "function svg(title,a){",
                 "var W=420,H=200,pl=46,pr=10,pt=20,pb=22,gw=W-pl-pr,gh=H-pt-pb,i,j;",
                 "var s='<svg viewBox=\"0 0 '+W+' '+H+'\" width=\"100%\" style=\"display:block\">';",
@@ -785,14 +880,18 @@ namespace WiFiLive {
                 "s+='<line x1=\"'+pl+'\" y1=\"'+yy+'\" x2=\"'+(pl+gw)+'\" y2=\"'+yy+'\" stroke=\"#eee\"/>';",
                 "s+='<text x=\"2\" y=\"'+(+yy+3)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"10\">'+yl[j].toFixed(1)+'</text>';}",
                 "var p='';for(i=0;i<a.length;i++)p+=xf(i)+','+yf(a[i])+' ';",
-                "s+='<polyline fill=\"none\" stroke=\"rgba(66,201,201,1)\" stroke-width=\"2\" points=\"'+p+'\"/>';",
+                "s+='<polyline fill=\"none\" stroke=\"#8bc220\" stroke-width=\"2\" points=\"'+p+'\"/>';",
                 "var tk=4;for(i=0;i<=tk;i++){var f=i/tk,xx=(pl+f*gw).toFixed(1),ago=Math.round((1-f)*(a.length-1)*2);",
                 "s+='<line x1=\"'+xx+'\" y1=\"'+(pt+gh)+'\" x2=\"'+xx+'\" y2=\"'+(pt+gh+3)+'\" stroke=\"#ccc\"/>';",
                 "s+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}",
                 "return s+'</svg>';}",
                 // Multi-series chart: one labelled, coloured line per node.
                 "function svgM(title,series){",
-                "var W=420,H=210,pl=46,pr=10,pt=22,pb=22,gw=W-pl-pr,gh=H-pt-pb,i,k;",
+                // pt (top padding) leaves room for the column title AND the node legend
+                // underneath it. At pt=22 the two sat 8 px apart and read as one
+                // block; 32 separates them clearly. H grows to match so the plot
+                // area itself is unchanged.
+                "var W=420,H=220,pl=46,pr=10,pt=32,pb=22,gw=W-pl-pr,gh=H-pt-pb,i,k;",
                 "var o='<svg viewBox=\"0 0 '+W+' '+H+'\" width=\"100%\" style=\"display:block\">';",
                 "o+='<text x=\"'+pl+'\" y=\"13\" fill=\"#4a5261\" font-family=\"sans-serif\" font-size=\"12\" font-weight=\"bold\">'+title+'</text>';",
                 "var all=[];for(k=0;k<series.length;k++)for(i=0;i<series[k].v.length;i++)all.push(series[k].v[i]);",
@@ -812,8 +911,8 @@ namespace WiFiLive {
                 "o+='<line x1=\"'+xx+'\" y1=\"'+(pt+gh)+'\" x2=\"'+xx+'\" y2=\"'+(pt+gh+3)+'\" stroke=\"#ccc\"/>';",
                 "o+='<text x=\"'+xx+'\" y=\"'+(H-6)+'\" fill=\"#888\" font-family=\"sans-serif\" font-size=\"9\" text-anchor=\"'+(i==0?'start':i==tk?'end':'middle')+'\">'+(ago?'-'+ago+'s':'jetzt')+'</text>';}",
                 "var lx=pl+4;for(k=0;k<series.length;k++){",
-                "o+='<rect x=\"'+lx+'\" y=\"'+(pt-9)+'\" width=\"9\" height=\"9\" fill=\"'+series[k].c+'\"/>';",
-                "o+='<text x=\"'+(lx+12)+'\" y=\"'+(pt-1)+'\" fill=\"#555\" font-family=\"sans-serif\" font-size=\"10\">'+series[k].n+'</text>';",
+                "o+='<rect x=\"'+lx+'\" y=\"'+(pt-11)+'\" width=\"9\" height=\"9\" fill=\"'+series[k].c+'\"/>';",
+                "o+='<text x=\"'+(lx+12)+'\" y=\"'+(pt-3)+'\" fill=\"#555\" font-family=\"sans-serif\" font-size=\"10\">'+series[k].n+'</text>';",
                 "lx+=22+series[k].n.length*6;}",
                 "return o+'</svg>';}",
                 // Render the Node x sensors table and one per-sensor chart (a line
@@ -852,16 +951,19 @@ namespace WiFiLive {
                 "for(var ri=1;ri<nr.length;ri++)rows.push(nr[ri]);",
                 "if(rows.length>500)rows.splice(0,rows.length-500);",
                 "console.log('poll: X-Row-Count='+rc+' neueZeilen='+(nr.length>0?nr.length-1:0)+' offset='+offset+' puffer='+rows.length);",
-                "if(!rows.length){s.textContent='(warte auf Daten...)';return;}",
+                "if(!rows.length){s.className='wait';s.innerHTML=WAIT;return;}",
                 "if(nodeIx>=0){renderN();}else{",
                 "var d=rows.slice(-100),last=d[d.length-1],ci;",
                 "for(ci=0;ci<cols.length;ci++){if(!rowEls[ci])continue;",
                 "rowEls[ci].v.textContent=last[ci]!==undefined?last[ci]:'';",
                 "var arr=[],di;for(di=0;di<d.length;di++){var f=parseFloat(d[di][ci]);arr.push(isNaN(f)?0:f);}",
                 "rowEls[ci].b.innerHTML=svg(cols[ci],arr);}}",
-                "lu.textContent='Letzte Aktualisierung: '+new Date().toLocaleString();",
-                "s.textContent='aktualisiert';",
-                "}catch(e){s.textContent='(warte auf Daten...)';}",
+                // One line only: "Letzte Aktualisierung: <time>" already says the
+                // page is live, so the separate "aktualisiert" status was a
+                // second line saying the same thing.
+                "lu.textContent='Letzte Aktualisierung: '+new Date().toLocaleTimeString();",
+                "s.className='';s.textContent='';",
+                "}catch(e){s.className='wait';s.innerHTML=WAIT;}",
                 "finally{clearTimeout(tmo);inflight=false;}}",
                 "var elT=[document.getElementById('tA'),document.getElementById('tB'),document.getElementById('tC')];",
                 "var elS=[document.getElementById('sA'),document.getElementById('sB'),document.getElementById('sC')];",
