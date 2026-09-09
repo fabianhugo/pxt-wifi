@@ -2,8 +2,11 @@
     "WiFi|block": "WiFi",
     "WiFi.setupWifi|block": "Configurar WiFi|TX %txPin|RX %rxPin|Velocidad %baudrate|SSID = %ssid|Contraseña = %passwd",
     "WiFi.wifiOK|block": "¿WiFi conectado?",
-    "WiFi.sendToThinkSpeak|block": "Enviar datos a ThingSpeak|Write API Key %apiKey|Campo1 %field1|Campo2 %field2||Campo3 %field3|Campo4 %field4|Campo5 %field5|Campo6 %field6|Campo7 %field7|Campo8 %field8",
+    "WiFi.sendToThingSpeak|block": "Enviar datos a tu canal de ThingSpeak|Write API Key %apiKey|Campo1 %field1|Campo2 %field2||Campo3 %field3|Campo4 %field4|Campo5 %field5|Campo6 %field6|Campo7 %field7|Campo8 %field8",
     "WiFi.sendToIFTTT|block": "Enviar datos al evento IFTTT|Evento %event|Clave %key|valor1 %value1||valor2 %value2|valor3 %value3",
+    "WiFi.sendToThingsboard|block": "Enviar datos a tu servidor Thingsboard|Token %AccessToken|Dato_1 %Daten1||Dato_2 %Daten2|Dato_3 %Daten3|Dato_4 %Daten4|Dato_5 %Daten5|Dato_6 %Daten6|Dato_7 %Daten7|Dato_8 %Daten8",
+    "WiFi.setThingsboardServer|block": "Cambiar servidor Thingsboard %Serveradresse|dirección %Port|puerto",
     "WiFi.sendMessage|block": "Enviar mensaje|Tipo %type|Servidor %address|Puerto %port|Mensaje %message",
-    "WiFi.adafruitIOPost|block": "Adafruit IO POST|Usuario %username|Feed %feed|Valor %value|Clave AIO %aioKey"
+    "WiFi.adafruitIOGetValue|block": "Adafruit IO GET|Usuario %username|Clave AIO %aioKey|Feed %feed",
+    "WiFi.adafruitIOPost|block": "Adafruit IO POST|Usuario %username|Clave AIO %aioKey|Feed %feed|Valor %value"
 }

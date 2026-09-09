@@ -2,8 +2,11 @@
     "WiFi|block": "WiFi",
     "WiFi.setupWifi|block": "WiFi einrichten|TX %txPin|RX %rxPin|Baudrate %baudrate|SSID = %ssid|Passwort = %passwd",
     "WiFi.wifiOK|block": "WiFi verbunden?",
-    "WiFi.sendToThinkSpeak|block": "Daten an ThingSpeak senden|Write API Key %apiKey|Feld1 %field1|Feld2 %field2||Feld3 %field3|Feld4 %field4|Feld5 %field5|Feld6 %field6|Feld7 %field7|Feld8 %field8",
+    "WiFi.sendToThingSpeak|block": "Daten an deinen ThingSpeak-Kanal senden|Write API Key %apiKey|Feld1 %field1|Feld2 %field2||Feld3 %field3|Feld4 %field4|Feld5 %field5|Feld6 %field6|Feld7 %field7|Feld8 %field8",
     "WiFi.sendToIFTTT|block": "Daten an IFTTT-Ereignis senden|Ereignis %event|Schlüssel %key|Wert1 %value1||Wert2 %value2|Wert3 %value3",
+    "WiFi.sendToThingsboard|block": "Daten an deinen Thingsboard-Server senden|Token %AccessToken|Daten_1 %Daten1||Daten_2 %Daten2|Daten_3 %Daten3|Daten_4 %Daten4|Daten_5 %Daten5|Daten_6 %Daten6|Daten_7 %Daten7|Daten_8 %Daten8",
+    "WiFi.setThingsboardServer|block": "Thingsboard-Server ändern %Serveradresse|Adresse %Port|Port",
     "WiFi.sendMessage|block": "Nachricht senden|Typ %type|Server %address|Port %port|Nachricht %message",
-    "WiFi.adafruitIOPost|block": "Adafruit IO POST|Benutzername %username|Feed %feed|Wert %value|AIO-Schlüssel %aioKey"
+    "WiFi.adafruitIOGetValue|block": "Adafruit IO GET|Benutzername %username|AIO-Schlüssel %aioKey|Feed %feed",
+    "WiFi.adafruitIOPost|block": "Adafruit IO POST|Benutzername %username|AIO-Schlüssel %aioKey|Feed %feed|Wert %value"
 }

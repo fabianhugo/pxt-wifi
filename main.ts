@@ -6,7 +6,7 @@ enum MessageType {
  * Functions to operate Grove module.
  */
 //% weight=10 color=#9F79EE icon="\uf1b3" block="WiFi"
-//% groups='["UartWiFi"]'
+//% groups='["Connection", "Adafruit IO", "ThingSpeak", "IFTTT", "Thingsboard"]'
 namespace WiFi {
     /**
      * 
@@ -18,10 +18,11 @@ namespace WiFi {
      * Setup Grove - Uart WiFi V2 to connect to  Wi-Fi
      */
     //% block="Setup Wifi|TX %txPin|RX %rxPin|Baud rate %baudrate|SSID = %ssid|Password = %passwd"
-    //% group="UartWiFi"
     //% txPin.defl=SerialPin.C17
     //% rxPin.defl=SerialPin.C16
-    //% baudRate.defl=BaudRate.BaudRate9600
+    //% baudRate.defl=BaudRate.BaudRate115200
+    //% group="Connection"
+    //% weight=90
     export function setupWifi(txPin: SerialPin, rxPin: SerialPin, baudRate: BaudRate, ssid: string, passwd: string) {
         let result = 0
 
@@ -75,7 +76,8 @@ namespace WiFi {
      * Check if Grove - Uart WiFi V2 is connected to Wifi
      */
     //% block="Wifi OK?"
-    //% group="UartWiFi"
+    //% weight=85
+    //% group="Connection"
     export function wifiOK() {
         return isWifiConnected
     }
@@ -84,9 +86,10 @@ namespace WiFi {
      * Send data to ThingSpeak
      */
     //% block="Send Data to your ThingSpeak Channel|Write API Key %apiKey|Field1 %field1|Field2 %field2||Field3 %field3|Field4 %field4|Field5 %field5|Field6 %field6|Field7 %field7|Field8 %field8"
-    //% group="UartWiFi"
+    //% group="ThingsSpeak"
     //% expandableArgumentMode="enabled"
     //% apiKey.defl="your Write API Key"
+    //% weight=70
     export function sendToThingSpeak(apiKey: string, field1: number = 0, field2: number = 0, field3: number = 0, field4: number = 0, field5: number = 0, field6: number = 0, field7: number = 0, field8: number = 0) {
         let result = 0
         let retry = 2
@@ -127,12 +130,13 @@ namespace WiFi {
      * Send data to IFTTT
      */
     //% block="Send Data to your IFTTT Event|Event %event|Key %key|value1 %value1||value2 %value2|value3 %value3"
-    //% group="UartWiFi"
+    //% group="IFTTT"
     //% event.defl="your Event"
     //% key.defl="your Key"
     //% value1.defl="Hello"
     //% value2.defl="Calliope"
     //% value3.defl="mini"
+    //% weight=65
     export function sendToIFTTT(event: string, key: string, value1: string, value2: string, value3: string) {
         let result = 0
         let retry = 2
@@ -175,11 +179,88 @@ namespace WiFi {
         }
     }
 
+    let ThingsboardAdresse = "paminasogo.ddns.net"
+    let ThingsboardPort = "9090"
+    /**
+      * Send data to Thingsboard
+      */
+    //% block="Send Data to your Thingsboard Server|Token %AccessToken|Daten_1 %Daten1||Daten_2 %Daten2|Daten_3 %Daten3|Daten_4 %Daten4|Daten_5 %Daten5|Daten_6 %Daten6|Daten_7 %Daten7|Daten_8 %Daten8"
+    //% expandableArgumentMode="enabled"
+    //% AccessToken.defl="API Token(Thingsboard)"
+    //% group="Thingsboard"
+    //% weight=40
+    export function sendToThingsboard(AccessToken: string, Daten1: number = 0.0, Daten2: number = 0.0, Daten3: number = 0.0, Daten4: number = 0.0, Daten5: number = 0.0, Daten6: number = 0.0, Daten7: number = 0.0, Daten8: number = 0.0) {
+        let result = 0
+        let retry = 2
+
+        let data: { [key: string]: number } = {
+            "Daten1": Daten1,
+            "Daten2": Daten2,
+            "Daten3": Daten3,
+            "Daten4": Daten4,
+            "Daten5": Daten5,
+            "Daten6": Daten6,
+            "Daten7": Daten7,
+            "Daten8": Daten8
+        }
+
+
+        // close the previous TCP connection
+        if (isWifiConnected) {
+            sendAtCmd("AT+CIPCLOSE")
+            waitAtResponse("OK", "ERROR", "None", 200) //vorher 2000
+        }
+
+        const payload = JSON.stringify(data);
+        const request = `POST /api/v1/${AccessToken}/telemetry HTTP/1.1\r\n` +
+            `Host: ${ThingsboardAdresse}\r\n` +
+            `Content-Type: application/json\r\n` +
+            `Content-Length: ${payload.length}\r\n\r\n` +
+            `${payload}`;
+
+        while (isWifiConnected && retry > 0) {
+            retry = retry - 1;
+
+            sendAtCmd(`AT+CIPSTART="TCP","${ThingsboardAdresse}",${ThingsboardPort}\r\n`);
+            result = waitAtResponse("OK", "ALREADY CONNECTED", "ERROR", 200) //vorher 2000
+            if (result == 3) continue
+
+            sendAtCmd(`AT+CIPSEND=${request.length}\r\n`);
+            result = waitAtResponse(">", "OK", "ERROR", 200) //vorher 2000
+            if (result == 3) continue
+
+            sendAtCmd(request);
+            result = waitAtResponse("SEND OK", "SEND FAIL", "ERROR", 200) //vorher 5000
+            if (result == 1) break
+
+            // close the previous TCP connection
+            if (isWifiConnected) {
+                sendAtCmd("AT+CIPCLOSE")
+                waitAtResponse("OK", "ERROR", "None", 200) //vorher 2000
+            }
+
+
+        }
+    }
+    /**
+    * Set thingsboard adress and port
+    */
+    //% block="Change thingsboard Server %Serveradresse|adress %Port|port"
+    //% adress.defl="paminasogo.ddns.net"
+    //% port.defl="9090"
+    //% weight=8
+    //% group="Thingsboard"
+    export function setThingsboardServer(adress: string, port: string){
+    ThingsboardAdresse = adress;
+    ThingsboardPort = port;
+    }
+    
+    
+
     /**
      * Send a raw message via TCP or UDP
      */
     //% block="Send Message|Type %type|Server %address|Port %port|Message %message"
-    //% group="UartWiFi"
     //% weight=70
     //% advanced=true
     export function sendMessage(type: MessageType, address: string, port: number, message: string): void {
@@ -256,7 +337,8 @@ namespace WiFi {
     }
 
     //% block="Adafruit IO GET|Username %username|AIO Key %aioKey|Feed %feed"
-    //% group="UartWiFi"
+    //% group="Adafruit IO"
+    //% weight=75
     export function adafruitIOGetValue(username: string, aioKey: string, feed: string): string {
         clearSerialBuffer()
 
@@ -339,7 +421,8 @@ namespace WiFi {
         * Send value to an Adafruit IO feed (HTTP POST)
         */
     //% block="Adafruit IO POST|Username %username|AIO Key %aioKey|Feed %feed|Value %value"
-    //% group="UartWiFi"
+    //% group="Adafruit IO"
+    //% weight=80
     export function adafruitIOPost(username: string, aioKey: string, feed: string, value: string) {
         serial.readString() // dump old data 
         basic.pause(20)

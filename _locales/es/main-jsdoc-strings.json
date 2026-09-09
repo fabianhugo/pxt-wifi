@@ -2,8 +2,11 @@
     "WiFi": "Funciones para controlar el módulo Grove UART WiFi V2.",
     "WiFi.setupWifi": "Configura el módulo Grove UART WiFi V2 y conéctate a la red WiFi.",
     "WiFi.wifiOK": "Devuelve true si la conexión WiFi está activa.",
-    "WiFi.sendToThinkSpeak": "Envía hasta ocho campos a un canal de ThingSpeak.",
+    "WiFi.sendToThingSpeak": "Envía hasta ocho campos a un canal de ThingSpeak.",
     "WiFi.sendToIFTTT": "Activa un evento IFTTT con hasta tres valores.",
+    "WiFi.sendToThingsboard": "Envía datos a un servidor Thingsboard.",
+    "WiFi.setThingsboardServer": "Establece la dirección y el puerto del servidor Thingsboard.",
     "WiFi.sendMessage": "Envía un mensaje en bruto mediante TCP o UDP.",
+    "WiFi.adafruitIOGetValue": "Obtiene el último valor de un feed de Adafruit IO.",
     "WiFi.adafruitIOPost": "Envía un valor mediante HTTP POST a un feed de Adafruit IO."
 }
